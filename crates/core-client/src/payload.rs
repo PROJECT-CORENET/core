@@ -78,23 +78,48 @@ pub enum Payload {
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum SyncOp {
     /// Закреп, звук, архив.
-    ChatFlags { gid: String, pinned: bool, muted: bool, archived: bool },
+    ChatFlags {
+        gid: String,
+        pinned: bool,
+        muted: bool,
+        archived: bool,
+    },
     /// Прочитано до `up_to` (ts входящих).
-    ReadUpTo { gid: String, up_to: u64 },
-    MarkUnread { gid: String },
+    ReadUpTo {
+        gid: String,
+        up_to: u64,
+    },
+    MarkUnread {
+        gid: String,
+    },
     /// Чат удалён с устройства (без выхода из группы).
-    DeleteChat { gid: String },
-    ClearHistory { gid: String },
+    DeleteChat {
+        gid: String,
+    },
+    ClearHistory {
+        gid: String,
+    },
     /// Сообщение удалено «у себя».
-    DeleteLocal { gid: String, id: String },
+    DeleteLocal {
+        gid: String,
+        id: String,
+    },
     /// Настройки автозагрузки и кэша.
-    Media { json: String },
+    Media {
+        json: String,
+    },
     /// Настройка приложения (папки, оформление…): ключ и значение-JSON, последнее по времени побеждает.
-    App { key: String, value: String, ts: u64 },
+    App {
+        key: String,
+        value: String,
+        ts: u64,
+    },
     /// Устройство аккаунта: имя, платформа, нода подключения и ключ подписи MLS (по нему отключают).
     Device(DeviceRecord),
     /// Отключить устройство: все удаляют его из своих групп, само устройство стирает аккаунт.
-    RemoveDevice { id: String },
+    RemoveDevice {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

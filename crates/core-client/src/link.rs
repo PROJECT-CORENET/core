@@ -248,7 +248,9 @@ impl LinkChannel {
         if offer.role == role {
             return Err(Error::Other(match role {
                 LinkRole::New => "Этот QR — с нового устройства. Отсканируйте его устройством, где вы уже вошли".into(),
-                LinkRole::Existing => "Этот QR — с устройства, где вы уже вошли. Отсканируйте QR нового устройства".into(),
+                LinkRole::Existing => {
+                    "Этот QR — с устройства, где вы уже вошли. Отсканируйте QR нового устройства".into()
+                }
             }));
         }
         let (conn, events) = connect(&offer.node).await?;

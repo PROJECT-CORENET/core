@@ -39,6 +39,7 @@ pub use payload::{AttachmentRef, DeviceRecord, Invite, LinkPreview};
 use payload::{JoinReply, JoinRequest, LogCreds, MirrorCreds, Payload, SyncOp};
 use store::{ChatRow, MemberRow, MessageRow, MirrorRow, QueueRow, Store};
 pub use store::{ChatState, MessageStatus};
+pub use sync::link_receive_account;
 
 const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 const CREDS_LABEL: &str = "CORE/v1/log-creds";
@@ -403,6 +404,7 @@ impl Client {
                 signer
             }
         };
+        store.set(sync::SIG_KEY, sync::sig_hex(&signer).as_bytes())?;
         if store.get(DEVICE_ID_KEY)?.is_none() {
             store.set(DEVICE_ID_KEY, hex::encode(random_bytes::<8>()).as_bytes())?;
         }

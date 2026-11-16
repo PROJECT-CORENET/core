@@ -27,6 +27,9 @@ pub trait CoreListener: Send + Sync {
     fn changed(&self, chat_id: Option<String>);
     /// Участник печатает или готовит вложение (`kind`: text, voice, photo, file).
     fn typing(&self, chat_id: String, member_id: String, kind: String);
+    /// Другое устройство аккаунта изменило настройку приложения `key` (`devices` — список устройств,
+    /// `removed` — это устройство отключили, `*` — всё сразу после связывания).
+    fn synced(&self, key: String);
 }
 
 struct ListenerBridge(Arc<dyn CoreListener>);
@@ -38,6 +41,10 @@ impl cc::Listener for ListenerBridge {
 
     fn typing(&self, chat_id: String, member_id: String, kind: String) {
         self.0.typing(chat_id, member_id, kind);
+    }
+
+    fn synced(&self, key: String) {
+        self.0.synced(key);
     }
 }
 
@@ -148,6 +155,95 @@ pub struct ChatInfo {
     /// Нода резервного журнала (чат переедет туда, если его нода пропадёт).
     pub backup_node: Option<String>,
     pub archived: bool,
+    /// MLS group id (hex): одинаковый на всех устройствах аккаунта — им называют чаты в общих настройках.
+    pub gid: Option<String>,
+}
+
+/// Устройство аккаунта.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct DeviceInfo {
+    pub id: String,
+    pub name: String,
+    /// ios | macos
+    pub platform: String,
+    /// Нода, к которой подключено устройство (для карты сети).
+    pub node: String,
+    pub is_this: bool,
+    pub seen_ms: u64,
+}
+
+/// Одноразовый канал связывания устройств (QR).
+#[derive(uniffi::Object)]
+pub struct CoreLinkChannel {
+    inner: cc::LinkChannel,
+}
+
+fn link_role(existing: bool) -> cc::LinkRole {
+    if existing {
+        cc::LinkRole::Existing
+    } else {
+        cc::LinkRole::New
+    }
+}
+
+/// Показать QR для связывания. `existing` — на этом устройстве аккаунт уже есть.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn link_offer(node: String, existing: bool, device_name: String) -> Result<Arc<CoreLinkChannel>, CoreError> {
+    let inner = cc::LinkChannel::offer(&node, link_role(existing), &device_name).await?;
+    Ok(Arc::new(CoreLinkChannel { inner }))
+}
+
+/// Отсканировали QR другого устройства.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn link_scan(qr: String, existing: bool, device_name: String) -> Result<Arc<CoreLinkChannel>, CoreError> {
+    let inner = cc::LinkChannel::scan(&qr, link_role(existing), &device_name).await?;
+    Ok(Arc::new(CoreLinkChannel { inner }))
+}
+
+/// Похоже ли на QR связывания устройств.
+#[uniffi::export]
+pub fn is_link_qr(text: String) -> bool {
+    cc::LinkOffer::decode(&text).is_some()
+}
+
+/// Новое устройство: принять аккаунт и подготовить базу в `dir` (потом — обычный `open_client`).
+/// Возвращает имя аккаунта.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn link_receive_account(
+    channel: Arc<CoreLinkChannel>,
+    dir: String,
+    db_key: Option<Vec<u8>>,
+) -> Result<String, CoreError> {
+    Ok(cc::link_receive_account(&channel.inner, Path::new(&dir), db_key.as_deref()).await?)
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl CoreLinkChannel {
+    /// Строка для QR (у показывающей стороны).
+    pub fn qr(&self) -> Option<String> {
+        self.inner.qr()
+    }
+
+    /// Имя устройства на той стороне, если уже известно.
+    pub fn peer_name(&self) -> Option<String> {
+        self.inner.peer_name()
+    }
+
+    /// Дождаться, пока QR отсканируют; возвращает имя того устройства.
+    pub async fn wait_peer(&self, timeout_secs: u64) -> Result<String, CoreError> {
+        Ok(self.inner.wait_peer(std::time::Duration::from_secs(timeout_secs)).await?)
+    }
+
+    /// Отказать той стороне.
+    pub async fn decline(&self) -> Result<(), CoreError> {
+        self.inner.decline().await?;
+        self.inner.close().await;
+        Ok(())
+    }
+
+    pub async fn close(&self) {
+        self.inner.close().await;
+    }
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -251,6 +347,7 @@ fn chat(c: cc::Chat) -> ChatInfo {
         is_owner: c.is_owner,
         backup_node: c.backup_node,
         archived: c.archived,
+        gid: c.gid,
         avatar: c.avatar,
         members: c
             .members
@@ -487,6 +584,52 @@ impl CoreClient {
     pub fn storage_usage(&self) -> Result<StorageUsage, CoreError> {
         let u = self.inner.storage_usage()?;
         Ok(StorageUsage { photos: u.photos, videos: u.videos, voice: u.voice, files: u.files, database: u.database })
+    }
+
+    // ── несколько устройств ──
+
+    /// Старое устройство: отдать аккаунт новому (после подтверждения пользователем).
+    pub async fn link_send_account(&self, channel: Arc<CoreLinkChannel>) -> Result<(), CoreError> {
+        Ok(self.inner.link_send_account(&channel.inner).await?)
+    }
+
+    /// Общая для всех устройств настройка приложения (JSON).
+    pub fn set_app_setting(&self, key: String, value: String) -> Result<(), CoreError> {
+        Ok(self.inner.set_app_setting(&key, &value)?)
+    }
+
+    pub fn app_setting(&self, key: String) -> Result<Option<String>, CoreError> {
+        Ok(self.inner.app_setting(&key)?)
+    }
+
+    /// Сообщить о себе: имя устройства, платформа, нода подключения.
+    pub fn set_device(&self, name: String, platform: String, node: String) -> Result<(), CoreError> {
+        Ok(self.inner.set_device(&name, &platform, &node)?)
+    }
+
+    pub fn devices(&self) -> Result<Vec<DeviceInfo>, CoreError> {
+        Ok(self
+            .inner
+            .devices()?
+            .into_iter()
+            .map(|d| DeviceInfo {
+                id: d.id,
+                name: d.name,
+                platform: d.platform,
+                node: d.node,
+                is_this: d.is_this,
+                seen_ms: d.seen_ms,
+            })
+            .collect())
+    }
+
+    pub async fn remove_device(&self, device_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.remove_device(&device_id).await?)
+    }
+
+    /// Это устройство отключили с другого — нужно стереть данные.
+    pub fn is_removed(&self) -> bool {
+        self.inner.is_removed()
     }
 
     /// Удалить скачанные файлы указанных видов (`photo`, `video`, `voice`, `file`; пусто — все). Возвращает байты.
