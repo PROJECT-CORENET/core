@@ -1,0 +1,496 @@
+//! Клиентское ядро (аккаунт, MLS-чаты, вложения) для Swift.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use core_client as cc;
+
+use crate::CoreError;
+
+impl From<cc::Error> for CoreError {
+    fn from(e: cc::Error) -> Self {
+        match e {
+            cc::Error::Net(n) => n.into(),
+            cc::Error::Node(m) => CoreError::Node { message: m },
+            cc::Error::BadInvite => {
+                CoreError::Client { message: "Неверная ссылка-приглашение".into() }
+            }
+            cc::Error::NotReady => CoreError::Client { message: "Чат ещё подключается".into() },
+            other => CoreError::Client { message: other.to_string() },
+        }
+    }
+}
+
+/// Колбэк из Rust: изменился чат `chat_id` (или список чатов, если `None`). Вызывается не на главном потоке.
+#[uniffi::export(with_foreign)]
+pub trait CoreListener: Send + Sync {
+    fn changed(&self, chat_id: Option<String>);
+    /// Участник печатает или готовит вложение (`kind`: text, voice, photo, file).
+    fn typing(&self, chat_id: String, member_id: String, kind: String);
+}
+
+struct ListenerBridge(Arc<dyn CoreListener>);
+
+impl cc::Listener for ListenerBridge {
+    fn changed(&self, chat_id: Option<String>) {
+        self.0.changed(chat_id);
+    }
+
+    fn typing(&self, chat_id: String, member_id: String, kind: String) {
+        self.0.typing(chat_id, member_id, kind);
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ProfileInfo {
+    pub id: String,
+    pub name: String,
+    pub avatar: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MemberInfo {
+    pub id: String,
+    pub name: String,
+    pub avatar: Option<Vec<u8>>,
+    pub is_me: bool,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AttachmentInfo {
+    /// photo | video | voice | file
+    pub kind: String,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    pub thumb: Option<Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
+    pub duration_ms: u64,
+    pub waveform: Option<Vec<u8>>,
+    pub spoiler: bool,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MessageInfo {
+    pub id: String,
+    pub chat_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub outgoing: bool,
+    pub ts_ms: u64,
+    pub text: String,
+    /// sending | sent | read | failed | received
+    pub status: String,
+    pub attachment: Option<AttachmentInfo>,
+    /// Файл вложения на диске (если скачан).
+    pub local_path: Option<String>,
+    pub reply_to: Option<String>,
+    pub link: Option<LinkPreviewInfo>,
+    /// Пересланное: имя автора оригинала.
+    pub forwarded_from: Option<String>,
+    /// Пересланное: ключ автора — открыть его профиль.
+    pub forwarded_from_id: Option<String>,
+    /// Реакции в порядке появления.
+    pub reactions: Vec<ReactionInfo>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ReactionInfo {
+    pub emoji: String,
+    pub count: u32,
+    /// Среди поставивших есть я.
+    pub mine: bool,
+    /// Ключи поставивших.
+    pub senders: Vec<String>,
+}
+
+/// Автозагрузка по типам и лимит кэша (0 — без ограничений).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct MediaSettings {
+    pub auto_photos: bool,
+    pub auto_videos: bool,
+    pub auto_voice: bool,
+    pub auto_files: bool,
+    pub auto_max_bytes: u64,
+    pub cache_limit_bytes: u64,
+}
+
+/// Превью ссылки. Готовится на устройстве отправителя и едет внутри MLS.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct LinkPreviewInfo {
+    pub url: String,
+    pub title: String,
+    pub desc: String,
+    pub site: String,
+    pub image: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ChatInfo {
+    pub id: String,
+    pub title: String,
+    pub is_group: bool,
+    /// joining | active | left
+    pub state: String,
+    pub node: String,
+    pub unread: u32,
+    pub muted: bool,
+    pub pinned: bool,
+    pub last_ms: u64,
+    pub last_message: Option<MessageInfo>,
+    pub avatar: Option<Vec<u8>>,
+    pub members: Vec<MemberInfo>,
+    /// Чат «Избранное» (только вы).
+    pub is_saved: bool,
+    /// Группу создали вы — можно удалять участников.
+    pub is_owner: bool,
+    /// Нода резервного журнала (чат переедет туда, если его нода пропадёт).
+    pub backup_node: Option<String>,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct NewAttachment {
+    pub path: String,
+    pub kind: String,
+    pub name: String,
+    pub mime: String,
+    pub thumb: Option<Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
+    pub duration_ms: u64,
+    pub waveform: Option<Vec<u8>>,
+    pub spoiler: bool,
+    /// Пересылка: имя автора оригинала.
+    pub forwarded_from: Option<String>,
+    /// Пересылка: ключ автора оригинала.
+    pub forwarded_from_id: Option<String>,
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct StorageUsage {
+    pub photos: u64,
+    pub videos: u64,
+    pub voice: u64,
+    pub files: u64,
+    pub database: u64,
+}
+
+fn status(s: cc::MessageStatus) -> String {
+    match s {
+        cc::MessageStatus::Sending => "sending",
+        cc::MessageStatus::Sent => "sent",
+        cc::MessageStatus::Read => "read",
+        cc::MessageStatus::Failed => "failed",
+        cc::MessageStatus::Received => "received",
+        cc::MessageStatus::Delivered => "delivered",
+    }
+    .into()
+}
+
+fn message(m: cc::Message) -> MessageInfo {
+    MessageInfo {
+        id: m.id,
+        chat_id: m.chat_id,
+        sender_id: m.sender_id,
+        sender_name: m.sender_name,
+        outgoing: m.outgoing,
+        ts_ms: m.ts,
+        text: m.text,
+        status: status(m.status),
+        attachment: m.attachment.map(|a| AttachmentInfo {
+            kind: a.kind,
+            name: a.name,
+            mime: a.mime,
+            size: a.size,
+            thumb: a.thumb,
+            width: a.w,
+            height: a.h,
+            duration_ms: a.duration_ms,
+            waveform: a.wave,
+            spoiler: a.spoiler,
+        }),
+        local_path: m.local_path,
+        reply_to: m.reply_to,
+        link: m.link.map(|l| LinkPreviewInfo {
+            url: l.url,
+            title: l.title,
+            desc: l.desc,
+            site: l.site,
+            image: l.image,
+        }),
+        forwarded_from: m.forwarded_from,
+        forwarded_from_id: m.forwarded_from_id,
+        reactions: m
+            .reactions
+            .into_iter()
+            .map(|r| ReactionInfo { emoji: r.emoji, count: r.count, mine: r.mine, senders: r.senders })
+            .collect(),
+    }
+}
+
+fn chat(c: cc::Chat) -> ChatInfo {
+    ChatInfo {
+        id: c.id,
+        title: c.title,
+        is_group: c.is_group,
+        state: match c.state {
+            cc::ChatState::Joining => "joining",
+            cc::ChatState::Active => "active",
+            cc::ChatState::Left => "left",
+        }
+        .into(),
+        node: c.node,
+        unread: c.unread,
+        muted: c.muted,
+        pinned: c.pinned,
+        last_ms: c.last_ms,
+        last_message: c.last_message.map(message),
+        is_saved: c.is_saved,
+        is_owner: c.is_owner,
+        backup_node: c.backup_node,
+        archived: c.archived,
+        avatar: c.avatar,
+        members: c
+            .members
+            .into_iter()
+            .map(|m| MemberInfo { id: m.id, name: m.name, avatar: m.avatar, is_me: m.is_me })
+            .collect(),
+    }
+}
+
+/// Аккаунт на устройстве. Все сетевые вызовы — async, данные — из локальной базы.
+#[derive(uniffi::Object)]
+pub struct CoreClient {
+    inner: cc::Client,
+}
+
+/// Открыть (или создать) аккаунт в каталоге `dir`; новые чаты создаются на ноде `node`.
+#[uniffi::export(async_runtime = "tokio")]
+/// `db_key` — 32-байтный ключ SQLCipher (приложение держит его в Secure Enclave / файле).
+pub async fn open_client(dir: String, node: String, db_key: Option<Vec<u8>>) -> Result<Arc<CoreClient>, CoreError> {
+    let inner = cc::Client::open_with_key(Path::new(&dir), &node, db_key.as_deref()).await?;
+    Ok(Arc::new(CoreClient { inner }))
+}
+
+/// Похоже ли на ссылку-приглашение (для вставки из буфера).
+#[uniffi::export]
+pub fn is_invite_link(text: String) -> bool {
+    cc::Invite::decode(&text).is_some()
+}
+
+/// Что видно в приглашении до вступления: кто пригласил и (для группы) её название.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct InviteInfo {
+    pub inviter: String,
+    pub title: String,
+    pub node: String,
+}
+
+#[uniffi::export]
+pub fn parse_invite(link: String) -> Option<InviteInfo> {
+    let invite = cc::Invite::decode(&link)?;
+    Some(InviteInfo { inviter: invite.hint, title: invite.title, node: invite.node })
+}
+
+#[uniffi::export(async_runtime = "tokio")]
+impl CoreClient {
+    pub fn set_listener(&self, listener: Arc<dyn CoreListener>) {
+        self.inner.set_listener(Arc::new(ListenerBridge(listener)));
+    }
+
+    pub fn set_default_node(&self, node: String) {
+        self.inner.set_default_node(&node);
+    }
+
+    pub fn profile(&self) -> Result<ProfileInfo, CoreError> {
+        let p = self.inner.profile()?;
+        Ok(ProfileInfo { id: p.id, name: p.name, avatar: p.avatar })
+    }
+
+    pub async fn set_profile(&self, name: String, avatar: Option<Vec<u8>>) -> Result<(), CoreError> {
+        Ok(self.inner.set_profile(&name, avatar).await?)
+    }
+
+    pub fn chats(&self) -> Result<Vec<ChatInfo>, CoreError> {
+        Ok(self.inner.chats()?.into_iter().map(chat).collect())
+    }
+
+    pub fn chat(&self, chat_id: String) -> Result<ChatInfo, CoreError> {
+        Ok(chat(self.inner.chat(&chat_id)?))
+    }
+
+    pub fn messages(&self, chat_id: String, limit: u32, before: Option<String>) -> Result<Vec<MessageInfo>, CoreError> {
+        Ok(self.inner.messages(&chat_id, limit, before.as_deref())?.into_iter().map(message).collect())
+    }
+
+    /// Новый чат: возвращает [id чата, ссылка-приглашение].
+    pub async fn create_chat(&self, title: Option<String>) -> Result<Vec<String>, CoreError> {
+        let (id, link) = self.inner.create_chat(title.as_deref()).await?;
+        Ok(vec![id, link])
+    }
+
+    /// Id чата «Избранное»; создаётся при первом вызове (нужна связь с нодой).
+    pub async fn saved_chat(&self) -> Result<String, CoreError> {
+        Ok(self.inner.saved_chat().await?)
+    }
+
+    pub async fn invite_link(&self, chat_id: String) -> Result<String, CoreError> {
+        Ok(self.inner.invite_link(&chat_id).await?)
+    }
+
+    pub async fn accept_invite(&self, link: String) -> Result<String, CoreError> {
+        Ok(self.inner.accept_invite(&link).await?)
+    }
+
+    pub async fn rename_chat(&self, chat_id: String, title: String) -> Result<(), CoreError> {
+        Ok(self.inner.rename_chat(&chat_id, &title).await?)
+    }
+
+    pub fn set_muted(&self, chat_id: String, muted: bool) -> Result<(), CoreError> {
+        Ok(self.inner.set_muted(&chat_id, muted)?)
+    }
+
+    pub async fn send_typing(&self, chat_id: String, kind: String) -> Result<(), CoreError> {
+        Ok(self.inner.send_typing(&chat_id, &kind).await?)
+    }
+
+    pub fn set_archived(&self, chat_id: String, archived: bool) -> Result<(), CoreError> {
+        Ok(self.inner.set_archived(&chat_id, archived)?)
+    }
+
+    pub fn set_pinned(&self, chat_id: String, pinned: bool) -> Result<(), CoreError> {
+        Ok(self.inner.set_pinned(&chat_id, pinned)?)
+    }
+
+    pub async fn mark_read(&self, chat_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.mark_read(&chat_id).await?)
+    }
+
+    pub fn mark_unread(&self, chat_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.mark_unread(&chat_id)?)
+    }
+
+    pub async fn remove_member(&self, chat_id: String, member_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.remove_member(&chat_id, &member_id).await?)
+    }
+
+    pub async fn leave_chat(&self, chat_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.leave_chat(&chat_id).await?)
+    }
+
+    /// Ноды основной сети — для резервных журналов чатов.
+    pub async fn set_backup_nodes(&self, nodes: Vec<String>) {
+        // async — чтобы ядро запустило фоновую задачу внутри своего рантайма tokio.
+        self.inner.set_backup_nodes(nodes);
+    }
+
+    pub fn delete_chat(&self, chat_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.delete_chat(&chat_id)?)
+    }
+
+    pub fn clear_history(&self, chat_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.clear_history(&chat_id)?)
+    }
+
+    pub async fn send_text(
+        &self,
+        chat_id: String,
+        text: String,
+        reply_to: Option<String>,
+        link: Option<LinkPreviewInfo>,
+    ) -> Result<String, CoreError> {
+        let link =
+            link.map(|l| cc::LinkPreview { url: l.url, title: l.title, desc: l.desc, site: l.site, image: l.image });
+        Ok(self.inner.send_text(&chat_id, &text, reply_to, link).await?)
+    }
+
+    /// Переслать текст с подписью «Переслано от `from`».
+    pub async fn forward_text(
+        &self,
+        chat_id: String,
+        text: String,
+        link: Option<LinkPreviewInfo>,
+        from: String,
+        from_id: Option<String>,
+    ) -> Result<String, CoreError> {
+        let link =
+            link.map(|l| cc::LinkPreview { url: l.url, title: l.title, desc: l.desc, site: l.site, image: l.image });
+        Ok(self.inner.forward_text(&chat_id, &text, link, &from, from_id).await?)
+    }
+
+    pub async fn send_attachment(
+        &self,
+        chat_id: String,
+        attachment: NewAttachment,
+        caption: String,
+    ) -> Result<String, CoreError> {
+        let a = cc::OutgoingAttachment {
+            path: attachment.path,
+            kind: attachment.kind,
+            name: attachment.name,
+            mime: attachment.mime,
+            thumb: attachment.thumb,
+            width: attachment.width,
+            height: attachment.height,
+            duration_ms: attachment.duration_ms,
+            waveform: attachment.waveform,
+            spoiler: attachment.spoiler,
+            forwarded_from: attachment.forwarded_from,
+            forwarded_from_id: attachment.forwarded_from_id,
+        };
+        Ok(self.inner.send_attachment(&chat_id, a, &caption).await?)
+    }
+
+    pub async fn download(&self, message_id: String) -> Result<String, CoreError> {
+        Ok(self.inner.download(&message_id).await?)
+    }
+
+    pub fn delete_message(&self, message_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.delete_message_locally(&message_id)?)
+    }
+
+    /// Поставить реакцию; `None` — снять свою.
+    pub async fn react(&self, message_id: String, emoji: Option<String>) -> Result<(), CoreError> {
+        Ok(self.inner.react(&message_id, emoji.as_deref()).await?)
+    }
+
+    pub async fn delete_message_for_all(&self, message_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.delete_message_for_all(&message_id).await?)
+    }
+
+    pub fn media_settings(&self) -> MediaSettings {
+        let m = self.inner.media_settings();
+        MediaSettings {
+            auto_photos: m.auto_photos,
+            auto_videos: m.auto_videos,
+            auto_voice: m.auto_voice,
+            auto_files: m.auto_files,
+            auto_max_bytes: m.auto_max_bytes,
+            cache_limit_bytes: m.cache_limit_bytes,
+        }
+    }
+
+    /// Сохранить настройки автозагрузки и лимит кэша (лишнее удаляется сразу).
+    pub fn set_media_settings(&self, settings: MediaSettings) -> Result<(), CoreError> {
+        Ok(self.inner.set_media_settings(&cc::MediaSettings {
+            auto_photos: settings.auto_photos,
+            auto_videos: settings.auto_videos,
+            auto_voice: settings.auto_voice,
+            auto_files: settings.auto_files,
+            auto_max_bytes: settings.auto_max_bytes,
+            cache_limit_bytes: settings.cache_limit_bytes,
+        })?)
+    }
+
+    pub fn storage_usage(&self) -> Result<StorageUsage, CoreError> {
+        let u = self.inner.storage_usage()?;
+        Ok(StorageUsage { photos: u.photos, videos: u.videos, voice: u.voice, files: u.files, database: u.database })
+    }
+
+    /// Удалить скачанные файлы указанных видов (`photo`, `video`, `voice`, `file`; пусто — все). Возвращает байты.
+    pub fn clear_media(&self, kinds: Vec<String>) -> Result<u64, CoreError> {
+        Ok(self.inner.clear_media(&kinds)?)
+    }
+}

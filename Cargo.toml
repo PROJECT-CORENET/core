@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core-proto",
+    "crates/core-client",
+    "crates/core-crypto",
+    "crates/core-directory",
+    "crates/core-ffi",
+    "crates/core-net",
+    "crates/node",
+    "tools/core-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[workspace.dependencies]
+core-proto = { path = "crates/core-proto" }
+core-client = { path = "crates/core-client" }
+core-crypto = { path = "crates/core-crypto" }
+core-directory = { path = "crates/core-directory" }
+core-net = { path = "crates/core-net" }
+core-node = { path = "crates/node" }
+
+anyhow = "1"
+clap = { version = "4.5", features = ["derive", "env"] }
+ed25519-dalek = { version = "2.1", features = ["rand_core"] }
+hex = "0.4"
+prost = "0.13"
+rand = "0.8"
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+snow = "0.9.6"
+tempfile = "3"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4

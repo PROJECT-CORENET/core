@@ -1,0 +1,1807 @@
+//! Клиентское ядро CORE (§9–§11): аккаунт, чаты с E2E-шифрованием MLS (RFC 9420), приглашения,
+//! вложения, локальная база. Транспорт — ноды: журнал на чат, очереди для приглашений.
+//!
+//! Как устроен чат:
+//! 1. Создатель заводит MLS-группу, журнал на ноде и очередь-приглашение → ссылка `core-invite:…`.
+//! 2. Вступающий кладёт в очередь свой KeyPackage и адрес очереди для ответа.
+//! 3. Создатель добавляет его в группу (коммит — в журнал через compare-and-swap по эпохе),
+//!    отвечает Welcome + ключами журнала, зашифрованными экспортёром MLS новой эпохи.
+//! 4. Сообщения — MLS application messages в журнале; нода видит только шифротекст.
+
+mod media;
+pub mod payload;
+mod store;
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
+
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{ChaCha20Poly1305, Nonce};
+use core_crypto::{random_bytes, Ed25519Key};
+use core_net::{Client as NetClient, NetError, NodeAddr};
+use core_proto::msg::{
+    event, request, response, Event, LogAppend, LogCommit, LogEntry, LogNew, LogWatch, QueueAck, QueueDel, QueueNew,
+    QueueSend, QueueSub,
+};
+use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
+use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
+use openmls_rust_crypto::OpenMlsRustCrypto;
+use tokio::sync::mpsc;
+use tracing::{debug, info, warn};
+
+pub use payload::{AttachmentRef, Invite, LinkPreview};
+use payload::{JoinReply, JoinRequest, LogCreds, MirrorCreds, Payload};
+use store::{ChatRow, MemberRow, MessageRow, MirrorRow, QueueRow, Store};
+pub use store::{ChatState, MessageStatus};
+
+const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+const CREDS_LABEL: &str = "CORE/v1/log-creds";
+/// Прикладное сообщение должно поместиться в блоб журнала вместе с обёрткой MLS.
+const MAX_PAYLOAD: usize = 12 * 1024;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const RECONNECT_EVERY: Duration = Duration::from_secs(3);
+/// Нода чата недоступна дольше этого — переезжаем на резервный журнал.
+const FAILOVER_AFTER: Duration = Duration::from_secs(45);
+
+#[derive(Debug, thiserror::Error)]
+pub enum Error {
+    #[error("network: {0}")]
+    Net(#[from] NetError),
+    #[error("node refused: {0}")]
+    Node(String),
+    #[error("storage: {0}")]
+    Store(#[from] rusqlite::Error),
+    #[error("mls: {0}")]
+    Mls(String),
+    #[error("invalid invite link")]
+    BadInvite,
+    #[error("chat not found")]
+    NoChat,
+    #[error("chat is not ready yet")]
+    NotReady,
+    #[error("{0}")]
+    Other(String),
+}
+
+pub type Result<T> = std::result::Result<T, Error>;
+
+fn mls<E: std::fmt::Debug>(e: E) -> Error {
+    Error::Mls(format!("{e:?}"))
+}
+
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
+fn new_id() -> String {
+    hex::encode(random_bytes::<12>())
+}
+
+fn key(bytes: &[u8]) -> Ed25519Key {
+    Ed25519Key::from_bytes(bytes.try_into().expect("32-byte key"))
+}
+
+/// Колбэк для интерфейса: что-то изменилось (в чате `chat_id` или в списке чатов).
+pub trait Listener: Send + Sync {
+    fn changed(&self, chat_id: Option<String>);
+    /// Участник `member_id` печатает или что-то отправляет (`kind`: text, voice, photo, file).
+    fn typing(&self, _chat_id: String, _member_id: String, _kind: String) {}
+}
+
+// ───────────────────────────── Публичные модели ─────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct Profile {
+    pub id: String,
+    pub name: String,
+    pub avatar: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Chat {
+    pub id: String,
+    pub title: String,
+    pub is_group: bool,
+    pub state: ChatState,
+    pub node: String,
+    pub unread: u32,
+    pub muted: bool,
+    pub pinned: bool,
+    pub last_ms: u64,
+    pub last_message: Option<Message>,
+    pub avatar: Option<Vec<u8>>,
+    pub members: Vec<Member>,
+    pub can_invite: bool,
+    /// Чат «Избранное».
+    pub is_saved: bool,
+    /// Группу создали мы: можем удалять участников.
+    pub is_owner: bool,
+    /// Нода резервного журнала (переписка переедет туда, если нода чата пропадёт).
+    pub backup_node: Option<String>,
+    /// В архиве: скрыт из основного списка. Новое сообщение возвращает чат, если он не заглушён.
+    pub archived: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Member {
+    pub id: String,
+    pub name: String,
+    pub avatar: Option<Vec<u8>>,
+    pub is_me: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct Message {
+    pub id: String,
+    pub chat_id: String,
+    pub sender_id: String,
+    pub sender_name: String,
+    pub outgoing: bool,
+    pub ts: u64,
+    pub text: String,
+    pub status: MessageStatus,
+    pub attachment: Option<AttachmentRef>,
+    pub local_path: Option<String>,
+    pub reply_to: Option<String>,
+    pub link: Option<LinkPreview>,
+    /// Пересланное: имя автора оригинала.
+    pub forwarded_from: Option<String>,
+    /// Ключ автора оригинала (открыть профиль). Нет — пересылающий не знал его.
+    pub forwarded_from_id: Option<String>,
+    /// Реакции в порядке появления.
+    pub reactions: Vec<Reaction>,
+}
+
+/// Одна реакция под сообщением: эмодзи, сколько поставили и есть ли среди них моя.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reaction {
+    pub emoji: String,
+    pub count: u32,
+    pub mine: bool,
+    /// Кто поставил — ключи участников в порядке появления.
+    pub senders: Vec<String>,
+}
+
+/// Реакция — одно эмодзи (с модификаторами), не произвольный текст.
+const MAX_REACTION_BYTES: usize = 32;
+
+/// Автор пересылаемого: имя и, если известен, ключ.
+#[derive(Clone, Debug)]
+struct Forward {
+    name: String,
+    id: Option<String>,
+}
+
+impl Forward {
+    fn new(name: &str, id: Option<String>) -> Option<Self> {
+        let name = name.trim();
+        (!name.is_empty()).then(|| Self { name: name.to_string(), id: id.filter(|k| Self::valid_id(k)) })
+    }
+
+    /// Ключ участника — 64 hex-символа.
+    fn valid_id(key: &str) -> bool {
+        key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit())
+    }
+}
+
+/// Новое вложение от интерфейса: файл уже на диске, превью и метаданные посчитаны на устройстве.
+#[derive(Clone, Debug, Default)]
+pub struct OutgoingAttachment {
+    pub path: String,
+    pub kind: String,
+    pub name: String,
+    pub mime: String,
+    pub thumb: Option<Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
+    pub duration_ms: u64,
+    pub waveform: Option<Vec<u8>>,
+    /// Показать получателю размытым до нажатия.
+    pub spoiler: bool,
+    /// Пересылка: имя автора оригинала.
+    pub forwarded_from: Option<String>,
+    /// Пересылка: ключ автора оригинала.
+    pub forwarded_from_id: Option<String>,
+}
+
+/// Что скачивать само и сколько места отдавать под файлы.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct MediaSettings {
+    pub auto_photos: bool,
+    pub auto_videos: bool,
+    pub auto_voice: bool,
+    pub auto_files: bool,
+    /// Автоматически качаются только файлы не больше этого размера.
+    pub auto_max_bytes: u64,
+    /// Предел кэша вложений; 0 — без ограничений. Сверх предела удаляются самые старые файлы.
+    pub cache_limit_bytes: u64,
+}
+
+impl Default for MediaSettings {
+    fn default() -> Self {
+        Self {
+            auto_photos: true,
+            auto_videos: true,
+            auto_voice: true,
+            auto_files: false,
+            auto_max_bytes: media::AUTO_DOWNLOAD,
+            cache_limit_bytes: 0,
+        }
+    }
+}
+
+impl MediaSettings {
+    fn auto_download(&self, a: &AttachmentRef) -> bool {
+        let kind = match a.kind.as_str() {
+            "photo" => self.auto_photos,
+            "video" => self.auto_videos,
+            "voice" => self.auto_voice,
+            _ => self.auto_files,
+        };
+        kind && a.size <= self.auto_max_bytes
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StorageUsage {
+    pub photos: u64,
+    pub videos: u64,
+    pub voice: u64,
+    pub files: u64,
+    pub database: u64,
+}
+
+const MEDIA_SETTINGS_KEY: &str = "media_settings";
+const SAVED_CHAT_KEY: &str = "saved_chat";
+const SAVED_TITLE: &str = "Избранное";
+
+// ───────────────────────────── Клиент ─────────────────────────────
+
+#[derive(Clone)]
+pub struct Client {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    dir: PathBuf,
+    store: Store,
+    me: String,
+    engine: tokio::sync::Mutex<Engine>,
+    conns: Mutex<HashMap<String, Arc<NetClient>>>,
+    connecting: tokio::sync::Mutex<()>,
+    events: mpsc::UnboundedSender<(String, Event)>,
+    listener: RwLock<Option<Arc<dyn Listener>>>,
+    default_node: RwLock<String>,
+    downloading: Mutex<std::collections::HashSet<String>>,
+    /// Чтобы «Избранное» не создалось дважды при одновременных вызовах.
+    saved_lock: tokio::sync::Mutex<()>,
+    /// Ноды, где можно заводить резервные журналы (обычно — основная сеть пользователя).
+    backup_nodes: RwLock<Vec<String>>,
+    mirror_lock: tokio::sync::Mutex<()>,
+    /// С какого момента нода не отвечает.
+    down_since: Mutex<HashMap<String, Instant>>,
+    failover_after: RwLock<Duration>,
+    /// Чаты, по которым скоро уйдёт отчёт о доставке (один на пачку сообщений).
+    delivery_pending: Mutex<std::collections::HashSet<String>>,
+}
+
+/// Всё, что меняет состояние MLS, — строго по очереди под этим замком.
+struct Engine {
+    provider: OpenMlsRustCrypto,
+    signer: SignatureKeyPair,
+    credential: CredentialWithKey,
+}
+
+impl Engine {
+    fn create_config() -> MlsGroupCreateConfig {
+        MlsGroupCreateConfig::builder()
+            .ciphersuite(CIPHERSUITE)
+            .use_ratchet_tree_extension(true)
+            .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .padding_size(64)
+            .sender_ratchet_configuration(SenderRatchetConfiguration::new(32, 5000))
+            .build()
+    }
+
+    fn join_config() -> MlsGroupJoinConfig {
+        MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .wire_format_policy(PURE_CIPHERTEXT_WIRE_FORMAT_POLICY)
+            .padding_size(64)
+            .sender_ratchet_configuration(SenderRatchetConfiguration::new(32, 5000))
+            .build()
+    }
+
+    fn group(&self, chat: &ChatRow) -> Result<MlsGroup> {
+        let gid = chat.group_id.as_ref().ok_or(Error::NotReady)?;
+        MlsGroup::load(self.provider.storage(), &GroupId::from_slice(gid))
+            .map_err(mls)?
+            .ok_or_else(|| Error::Mls("group state missing".into()))
+    }
+
+    fn save(&self, store: &Store) -> Result<()> {
+        store.save_mls(&self.provider.storage().values.read().unwrap())?;
+        Ok(())
+    }
+
+    fn creds_key(&self, group: &MlsGroup) -> Result<[u8; 32]> {
+        let k = group.export_secret(self.provider.crypto(), CREDS_LABEL, &[], 32).map_err(mls)?;
+        Ok(k.try_into().unwrap())
+    }
+}
+
+fn seal(key: &[u8; 32], plain: &[u8]) -> Vec<u8> {
+    ChaCha20Poly1305::new(key.into()).encrypt(Nonce::from_slice(&[0; 12]), plain).expect("encrypt")
+}
+
+fn open(key: &[u8; 32], sealed: &[u8]) -> Result<Vec<u8>> {
+    ChaCha20Poly1305::new(key.into())
+        .decrypt(Nonce::from_slice(&[0; 12]), sealed)
+        .map_err(|_| Error::Mls("cannot decrypt log credentials".into()))
+}
+
+impl Client {
+    /// Открыть (или создать) аккаунт в каталоге `dir`. `default_node` — нода для новых чатов.
+    pub async fn open(dir: &Path, default_node: &str) -> Result<Self> {
+        Self::open_with_key(dir, default_node, None).await
+    }
+
+    /// То же, но база зашифрована SQLCipher ключом `db_key` (32 байта; хранит приложение —
+    /// например, под Secure Enclave). Старая открытая база шифруется при первом открытии.
+    pub async fn open_with_key(dir: &Path, default_node: &str, db_key: Option<&[u8]>) -> Result<Self> {
+        std::fs::create_dir_all(dir.join("media")).map_err(|e| Error::Other(e.to_string()))?;
+        if db_key.is_some_and(|k| k.len() != 32) {
+            return Err(Error::Other("database key must be 32 bytes".into()));
+        }
+        let store = Store::open(&dir.join("client.db"), db_key)?;
+
+        let provider = OpenMlsRustCrypto::default();
+        *provider.storage().values.write().unwrap() = store.load_mls()?;
+
+        let stored = store.get("account.id")?.zip(store.get("account.signer")?);
+        let (me, signer) = match stored {
+            Some((id, signer)) => {
+                let signer: SignatureKeyPair = serde_json::from_slice(&signer).map_err(mls)?;
+                (String::from_utf8(id).unwrap(), signer)
+            }
+            None => {
+                let id = hex::encode(random_bytes::<16>());
+                let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).map_err(mls)?;
+                store.set("account.id", id.as_bytes())?;
+                store.set("account.signer", &serde_json::to_vec(&signer).map_err(mls)?)?;
+                info!("🆔 new account {id}");
+                (id, signer)
+            }
+        };
+        signer.store(provider.storage()).map_err(mls)?;
+        let credential = CredentialWithKey {
+            credential: BasicCredential::new(me.as_bytes().to_vec()).into(),
+            signature_key: signer.to_public_vec().into(),
+        };
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let inner = Arc::new(Inner {
+            dir: dir.to_path_buf(),
+            store,
+            me,
+            engine: tokio::sync::Mutex::new(Engine { provider, signer, credential }),
+            conns: Mutex::default(),
+            connecting: tokio::sync::Mutex::new(()),
+            events: tx,
+            listener: RwLock::new(None),
+            default_node: RwLock::new(default_node.to_string()),
+            downloading: Mutex::default(),
+            saved_lock: tokio::sync::Mutex::default(),
+            backup_nodes: RwLock::default(),
+            mirror_lock: tokio::sync::Mutex::default(),
+            delivery_pending: Mutex::default(),
+            down_since: Mutex::default(),
+            failover_after: RwLock::new(FAILOVER_AFTER),
+        });
+        tokio::spawn(event_worker(Arc::downgrade(&inner), rx));
+        tokio::spawn(reconnect_loop(Arc::downgrade(&inner)));
+        Ok(Self { inner })
+    }
+
+    pub fn set_listener(&self, listener: Arc<dyn Listener>) {
+        *self.inner.listener.write().unwrap() = Some(listener);
+    }
+
+    pub fn set_default_node(&self, node: &str) {
+        *self.inner.default_node.write().unwrap() = node.to_string();
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.inner.dir
+    }
+
+    /// Ноды для резервных журналов. Для чатов без резерва он заводится сразу (в фоне).
+    pub fn set_backup_nodes(&self, nodes: Vec<String>) {
+        *self.inner.backup_nodes.write().unwrap() = nodes;
+        let inner = self.inner.clone();
+        tokio::spawn(async move { inner.ensure_mirrors().await });
+    }
+
+    /// Через сколько недоступности ноды переезжать на резерв (по умолчанию 45 с; для тестов).
+    pub fn set_failover_after(&self, after: Duration) {
+        *self.inner.failover_after.write().unwrap() = after;
+    }
+
+    /// Завести недостающие резервные журналы и дождаться результата.
+    pub async fn ensure_mirrors(&self) {
+        self.inner.ensure_mirrors().await;
+    }
+
+    // ── профиль ──
+
+    pub fn profile(&self) -> Result<Profile> {
+        let s = &self.inner.store;
+        Ok(Profile {
+            id: self.inner.me.clone(),
+            name: s.get("profile.name")?.map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default(),
+            avatar: s.get("profile.avatar")?,
+        })
+    }
+
+    /// Сохранить имя/аватар и разослать во все чаты (внутри MLS — нода их не видит).
+    pub async fn set_profile(&self, name: &str, avatar: Option<Vec<u8>>) -> Result<()> {
+        let s = &self.inner.store;
+        s.set("profile.name", name.trim().as_bytes())?;
+        match &avatar {
+            Some(a) => s.set("profile.avatar", a)?,
+            None => s.delete("profile.avatar")?,
+        }
+        for chat in s.chats()?.into_iter().filter(|c| c.state == ChatState::Active) {
+            if let Err(e) = self.inner.send_payload(&chat, &self.inner.profile_payload()?).await {
+                warn!("⚠️ profile broadcast to {} failed: {e}", chat.id);
+            }
+        }
+        self.inner.notify(None);
+        Ok(())
+    }
+
+    // ── чаты ──
+
+    /// Новый чат: MLS-группа, журнал и очередь-приглашение на ноде. Возвращает (id чата, ссылку).
+    pub async fn create_chat(&self, title: Option<&str>) -> Result<(String, String)> {
+        let chat = self.create_group(title).await?;
+        let link = self.invite_link(&chat.id).await?;
+        self.inner.notify(None);
+        Ok((chat.id, link))
+    }
+
+    /// «Избранное»: MLS-группа из одного участника со своим журналом на ноде
+    /// (заметки и пересланное; основа для синхронизации между своими устройствами).
+    pub async fn saved_chat(&self) -> Result<String> {
+        let _guard = self.inner.saved_lock.lock().await;
+        if let Some(id) = self.inner.saved_id() {
+            if self.inner.store.chat(&id)?.is_some() {
+                return Ok(id);
+            }
+        }
+        let chat = self.create_group(Some(SAVED_TITLE)).await?;
+        self.inner.store.set(SAVED_CHAT_KEY, chat.id.as_bytes())?;
+        info!("⭐ saved messages chat {}", chat.id);
+        self.inner.notify(None);
+        Ok(chat.id)
+    }
+
+    async fn create_group(&self, title: Option<&str>) -> Result<ChatRow> {
+        let node = self.inner.default_node.read().unwrap().clone();
+        let conn = self.inner.conn(&node).await?;
+        let (write, read) = (Ed25519Key::generate(), Ed25519Key::generate());
+        let log_id = random_bytes::<32>().to_vec();
+        expect_done(
+            conn.request(
+                request::Body::LogNew(LogNew {
+                    log_id: log_id.clone(),
+                    write_pk: write.public_key().to_vec(),
+                    read_pk: read.public_key().to_vec(),
+                }),
+                None,
+            )
+            .await?,
+        )?;
+
+        let engine = self.inner.engine.lock().await;
+        let group =
+            MlsGroup::new(&engine.provider, &engine.signer, &Engine::create_config(), engine.credential.clone())
+                .map_err(mls)?;
+        engine.save(&self.inner.store)?;
+        drop(engine);
+
+        let title = title.map(str::trim).filter(|t| !t.is_empty());
+        let chat = ChatRow {
+            id: new_id(),
+            group_id: Some(group.group_id().as_slice().to_vec()),
+            title: title.unwrap_or("Новый чат").to_string(),
+            custom_title: title.is_some(),
+            node: node.clone(),
+            log_id,
+            write_sk: write.to_bytes().to_vec(),
+            read_sk: read.to_bytes().to_vec(),
+            read_offset: 0,
+            state: ChatState::Active,
+            created_ms: now_ms(),
+            last_ms: now_ms(),
+            unread: 0,
+            muted: false,
+            pinned: false,
+        };
+        self.inner.store.insert_chat(&chat)?;
+        self.inner.store.set(&owner_key(&chat.id), b"1")?;
+        self.inner.watch_chat(&conn, &chat).await?;
+        info!("💬 chat {} created on {}", chat.id, short(&node));
+        Ok(chat)
+    }
+
+    /// Ссылка-приглашение в чат (создаёт очередь при первом вызове). Многоразовая.
+    pub async fn invite_link(&self, chat_id: &str) -> Result<String> {
+        let chat = self.inner.store.chat(chat_id)?.ok_or(Error::NoChat)?;
+        if chat.state != ChatState::Active {
+            return Err(Error::NotReady);
+        }
+        if self.inner.saved_id().as_deref() == Some(chat_id) {
+            return Err(Error::Other("saved messages can't be shared".into()));
+        }
+        let q = match self.inner.store.queue_for_chat("invites", chat_id)? {
+            Some(q) => q,
+            None => {
+                let conn = self.inner.conn(&chat.node).await?;
+                let q = new_queue(&conn, chat_id, &chat.node).await?;
+                self.inner.store.insert_queue("invites", &q)?;
+                subscribe_queue(&conn, &q).await?;
+                q
+            }
+        };
+        let hint = self.profile()?.name;
+        let node = chat.node.clone();
+        let model = self.inner.chat_model(chat)?;
+        let title = if model.is_group { model.title } else { String::new() };
+        Ok(Invite { v: 1, node, queue: q.sender_id, hint, title }.encode())
+    }
+
+    /// Вступить по ссылке. Чат появляется сразу в состоянии `Joining`, Welcome приходит асинхронно.
+    pub async fn accept_invite(&self, link: &str) -> Result<String> {
+        let invite = Invite::decode(link).ok_or(Error::BadInvite)?;
+        let conn = self.inner.conn(&invite.node).await?;
+        let chat_id = new_id();
+        let reply = new_queue(&conn, &chat_id, &invite.node).await?;
+
+        let engine = self.inner.engine.lock().await;
+        let bundle = KeyPackage::builder()
+            .build(CIPHERSUITE, &engine.provider, &engine.signer, engine.credential.clone())
+            .map_err(mls)?;
+        let key_package = bundle.key_package().tls_serialize_detached().map_err(mls)?;
+        engine.save(&self.inner.store)?;
+        drop(engine);
+
+        let title = [&invite.title, &invite.hint]
+            .into_iter()
+            .find(|t| !t.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "Подключение…".to_string());
+        self.inner.store.insert_chat(&ChatRow {
+            id: chat_id.clone(),
+            group_id: None,
+            title,
+            custom_title: false,
+            node: invite.node.clone(),
+            log_id: vec![],
+            write_sk: vec![],
+            read_sk: vec![],
+            read_offset: 0,
+            state: ChatState::Joining,
+            created_ms: now_ms(),
+            last_ms: now_ms(),
+            unread: 0,
+            muted: false,
+            pinned: false,
+        })?;
+        self.inner.store.insert_queue("joins", &reply)?;
+        subscribe_queue(&conn, &reply).await?;
+
+        let body = serde_json::to_vec(&JoinRequest { key_package, reply: reply.sender_id.clone() }).unwrap();
+        expect_done(conn.request(request::Body::QueueSend(QueueSend { sender_id: invite.queue, body }), None).await?)?;
+        info!("🤝 join request sent for chat {chat_id}");
+        self.inner.notify(None);
+        Ok(chat_id)
+    }
+
+    pub fn chats(&self) -> Result<Vec<Chat>> {
+        let mut out = vec![];
+        for row in self.inner.store.chats()? {
+            out.push(self.inner.chat_model(row)?);
+        }
+        out.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.last_ms.cmp(&a.last_ms)));
+        Ok(out)
+    }
+
+    pub fn chat(&self, chat_id: &str) -> Result<Chat> {
+        let row = self.inner.store.chat(chat_id)?.ok_or(Error::NoChat)?;
+        self.inner.chat_model(row)
+    }
+
+    pub fn messages(&self, chat_id: &str, limit: u32, before: Option<&str>) -> Result<Vec<Message>> {
+        let names = self.inner.member_names(chat_id)?;
+        Ok(self
+            .inner
+            .store
+            .messages(chat_id, limit, before)?
+            .into_iter()
+            .map(|m| self.inner.message_model(m, &names))
+            .collect())
+    }
+
+    pub async fn rename_chat(&self, chat_id: &str, title: &str) -> Result<()> {
+        let chat = self.inner.store.chat(chat_id)?.ok_or(Error::NoChat)?;
+        let title = title.trim();
+        self.inner.store.set_title(chat_id, title, !title.is_empty())?;
+        self.inner.send_payload(&chat, &Payload::Title { title: title.to_string() }).await?;
+        self.inner.notify(Some(chat_id.into()));
+        Ok(())
+    }
+
+    /// Удалить участника из группы (MLS-коммит: он больше не расшифрует новые сообщения).
+    pub async fn remove_member(&self, chat_id: &str, member_id: &str) -> Result<()> {
+        self.inner.remove_member(chat_id, member_id).await
+    }
+
+    /// Выйти из группы: попросить оставшихся удалить нас и убрать чат с устройства.
+    pub async fn leave_chat(&self, chat_id: &str) -> Result<()> {
+        if let Some(chat) = self.inner.store.chat(chat_id)?.filter(|c| c.state == ChatState::Active) {
+            if let Err(e) = self.inner.send_payload(&chat, &Payload::Leave).await {
+                warn!("⚠️ leave notice for chat {chat_id} not delivered: {e}");
+            }
+        }
+        info!("👋 left chat {chat_id}");
+        self.delete_chat(chat_id)
+    }
+
+    pub fn set_muted(&self, chat_id: &str, muted: bool) -> Result<()> {
+        self.inner.store.set_flag(chat_id, "muted", muted)?;
+        self.inner.notify(Some(chat_id.into()));
+        Ok(())
+    }
+
+    /// «Печатает…»: сообщить участникам, что мы набираем текст или готовим вложение.
+    /// Частоту ограничивает приложение (раз в несколько секунд).
+    pub async fn send_typing(&self, chat_id: &str, kind: &str) -> Result<()> {
+        let chat = self.inner.store.chat(chat_id)?.ok_or(Error::NoChat)?;
+        if chat.state != ChatState::Active || self.inner.saved_id().as_deref() == Some(chat_id) {
+            return Ok(());
+        }
+        self.inner.send_payload(&chat, &Payload::Typing { kind: kind.into(), ts: now_ms() }).await.map(drop)
+    }
+
+    /// Убрать в архив / вернуть. Сообщения и участие в чате не меняются.
+    pub fn set_archived(&self, chat_id: &str, archived: bool) -> Result<()> {
+        if archived {
+            self.inner.store.set(&archive_key(chat_id), b"1")?;
+        } else {
+            self.inner.store.delete(&archive_key(chat_id))?;
+        }
+        self.inner.notify(None);
+        Ok(())
+    }
+
+    pub fn set_pinned(&self, chat_id: &str, pinned: bool) -> Result<()> {
+        self.inner.store.set_flag(chat_id, "pinned", pinned)?;
+        self.inner.notify(None);
+        Ok(())
+    }
+
+    /// Прочитано: сбросить счётчик и отправить отчёт о прочтении участникам.
+    pub async fn mark_read(&self, chat_id: &str) -> Result<()> {
+        let had = self.inner.store.clear_unread(chat_id)?;
+        if had > 0 {
+            if let Some(chat) = self.inner.store.chat(chat_id)?.filter(|c| c.state == ChatState::Active) {
+                let up_to = self.inner.store.max_incoming_ts(chat_id)?;
+                self.inner.send_payload(&chat, &Payload::Read { up_to }).await?;
+            }
+            self.inner.notify(None);
+        }
+        Ok(())
+    }
+
+    pub fn mark_unread(&self, chat_id: &str) -> Result<()> {
+        self.inner.store.touch_chat(chat_id, 0, 1)?;
+        self.inner.notify(None);
+        Ok(())
+    }
+
+    /// Удалить чат на этом устройстве (участники продолжат переписку без нас).
+    pub fn delete_chat(&self, chat_id: &str) -> Result<()> {
+        for m in self.inner.store.messages(chat_id, u32::MAX, None)? {
+            if let Some(p) = m.file_path {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        self.inner.store.delete_chat(chat_id)?;
+        self.inner.notify(None);
+        Ok(())
+    }
+
+    pub fn clear_history(&self, chat_id: &str) -> Result<()> {
+        self.inner.store.clear_history(chat_id)?;
+        self.inner.notify(Some(chat_id.into()));
+        Ok(())
+    }
+
+    // ── сообщения ──
+
+    /// `link` — превью ссылки, подготовленное на устройстве отправителя (необязательно).
+    pub async fn send_text(
+        &self,
+        chat_id: &str,
+        text: &str,
+        reply_to: Option<String>,
+        link: Option<LinkPreview>,
+    ) -> Result<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(Error::Other("empty message".into()));
+        }
+        let link = link.and_then(LinkPreview::sanitized);
+        self.inner.send_message(chat_id, text.to_string(), None, reply_to, None, link, None).await
+    }
+
+    /// Переслать текст: у получателя над ним будет «Переслано от `from`»; по `from_id` открывается профиль автора.
+    pub async fn forward_text(
+        &self,
+        chat_id: &str,
+        text: &str,
+        link: Option<LinkPreview>,
+        from: &str,
+        from_id: Option<String>,
+    ) -> Result<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Err(Error::Other("empty message".into()));
+        }
+        let link = link.and_then(LinkPreview::sanitized);
+        let from = Forward::new(from, from_id);
+        self.inner.send_message(chat_id, text.to_string(), None, None, None, link, from).await
+    }
+
+    /// Отправить файл: копия кладётся в медиатеку, шифруется и выгружается кусками в отдельный журнал.
+    pub async fn send_attachment(&self, chat_id: &str, att: OutgoingAttachment, caption: &str) -> Result<String> {
+        let id = new_id();
+        let ext = Path::new(&att.name).extension().and_then(|e| e.to_str()).unwrap_or("bin");
+        let local = self.inner.dir.join("media").join(format!("{id}.{ext}"));
+        std::fs::copy(&att.path, &local).map_err(|e| Error::Other(format!("read file: {e}")))?;
+        let size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+        if size > media::MAX_FILE {
+            let _ = std::fs::remove_file(&local);
+            return Err(Error::Other("file is larger than 100 MB".into()));
+        }
+        let fwd = att.forwarded_from.and_then(|f| Forward::new(&f, att.forwarded_from_id));
+        let mut thumb = att.thumb;
+        if thumb.as_ref().is_some_and(|t| t.len() > 8 * 1024) {
+            thumb = None;
+        }
+        let draft = AttachmentRef {
+            kind: att.kind,
+            name: att.name,
+            mime: att.mime,
+            size,
+            thumb,
+            w: att.width,
+            h: att.height,
+            duration_ms: att.duration_ms,
+            wave: att.waveform,
+            spoiler: att.spoiler,
+            ..Default::default()
+        };
+        self.inner
+            .send_message(chat_id, caption.trim().to_string(), Some((draft, local)), None, Some(id), None, fwd)
+            .await
+    }
+
+    /// Скачать вложение (маленькие скачиваются сами). Возвращает путь к файлу.
+    pub async fn download(&self, message_id: &str) -> Result<String> {
+        self.inner.download(message_id).await
+    }
+
+    pub fn delete_message_locally(&self, message_id: &str) -> Result<()> {
+        if let Some(m) = self.inner.store.message(message_id)? {
+            if let Some(p) = m.file_path {
+                let _ = std::fs::remove_file(p);
+            }
+            self.inner.store.delete_message(message_id)?;
+            self.inner.notify(Some(m.chat_id));
+        }
+        Ok(())
+    }
+
+    /// Поставить реакцию (`None` или пустая строка — снять). Одна на участника: новая заменяет прежнюю.
+    pub async fn react(&self, message_id: &str, emoji: Option<&str>) -> Result<()> {
+        let m = self.inner.store.message(message_id)?.ok_or(Error::Other("no such message".into()))?;
+        let emoji = emoji.map(str::trim).filter(|e| !e.is_empty());
+        if emoji.is_some_and(|e| e.len() > MAX_REACTION_BYTES) {
+            return Err(Error::Other("reaction is too long".into()));
+        }
+        let chat = self.inner.store.chat(&m.chat_id)?.ok_or(Error::NoChat)?;
+        self.inner.store.set_reaction(&m.id, &self.inner.me, emoji, now_ms())?;
+        self.inner.notify(Some(m.chat_id.clone()));
+        let payload = Payload::React { id: m.id, emoji: emoji.unwrap_or_default().to_string() };
+        self.inner.send_payload(&chat, &payload).await.map(drop)
+    }
+
+    /// Удалить у всех: своё сообщение удаляется и у участников.
+    pub async fn delete_message_for_all(&self, message_id: &str) -> Result<()> {
+        let Some(m) = self.inner.store.message(message_id)? else { return Ok(()) };
+        if m.outgoing {
+            let chat = self.inner.store.chat(&m.chat_id)?.ok_or(Error::NoChat)?;
+            self.inner.send_payload(&chat, &Payload::Delete { id: m.id.clone() }).await?;
+        }
+        self.delete_message_locally(message_id)
+    }
+
+    // ── хранилище ──
+
+    pub fn media_settings(&self) -> MediaSettings {
+        self.inner.media_settings()
+    }
+
+    /// Сохранить настройки и сразу применить новый лимит кэша.
+    pub fn set_media_settings(&self, settings: &MediaSettings) -> Result<()> {
+        self.inner.store.set(MEDIA_SETTINGS_KEY, &serde_json::to_vec(settings).unwrap())?;
+        self.inner.enforce_cache_limit(None)?;
+        Ok(())
+    }
+
+    pub fn storage_usage(&self) -> Result<StorageUsage> {
+        let mut u = StorageUsage::default();
+        for (_, kind, path) in self.inner.store.media_files()? {
+            let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            match kind.as_str() {
+                "photo" => u.photos += size,
+                "video" => u.videos += size,
+                "voice" => u.voice += size,
+                _ => u.files += size,
+            }
+        }
+        for f in ["client.db", "client.db-wal"] {
+            u.database += std::fs::metadata(self.inner.dir.join(f)).map(|m| m.len()).unwrap_or(0);
+        }
+        Ok(u)
+    }
+
+    /// Очистить кэш вложений: файлы удаляются, сообщения остаются (можно скачать снова).
+    pub fn clear_media(&self, kinds: &[String]) -> Result<u64> {
+        let mut freed = 0;
+        for (_, kind, path) in self.inner.store.media_files()? {
+            let k = if matches!(kind.as_str(), "photo" | "video" | "voice") { kind.as_str() } else { "file" };
+            if kinds.is_empty() || kinds.iter().any(|x| x == k) {
+                freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        // Пути к удалённым файлам больше не валидны.
+        for m in self.inner.store.media_files()? {
+            if !Path::new(&m.2).exists() {
+                self.inner.store.clear_file_paths_for(&m.2)?;
+            }
+        }
+        self.inner.notify(None);
+        Ok(freed)
+    }
+
+    /// Подождать, пока клиент разберёт входящие события (для тестов).
+    pub async fn settle(&self) {
+        let _ = self.inner.engine.lock().await;
+    }
+}
+
+// ───────────────────────────── Внутреннее ─────────────────────────────
+
+impl Inner {
+    fn notify(&self, chat_id: Option<String>) {
+        if let Some(l) = self.listener.read().unwrap().clone() {
+            l.changed(chat_id);
+        }
+    }
+
+    fn profile_payload(&self) -> Result<Payload> {
+        let name =
+            self.store.get("profile.name")?.map(|v| String::from_utf8_lossy(&v).into_owned()).unwrap_or_default();
+        let avatar = self.store.get("profile.avatar")?.filter(|a| a.len() <= 9 * 1024);
+        Ok(Payload::Profile { name, avatar })
+    }
+
+    fn member_names(&self, chat_id: &str) -> Result<HashMap<String, String>> {
+        Ok(self.store.members(chat_id)?.into_iter().map(|m| (m.member_id, m.name)).collect())
+    }
+
+    fn message_model(&self, m: MessageRow, names: &HashMap<String, String>) -> Message {
+        let sender_name = if m.outgoing { String::new() } else { names.get(&m.sender_id).cloned().unwrap_or_default() };
+        let mut reactions: Vec<Reaction> = Vec::new();
+        for (emoji, sender) in self.store.reactions(&m.id).unwrap_or_default() {
+            let mine = sender == self.me;
+            match reactions.iter_mut().find(|r| r.emoji == emoji) {
+                Some(r) => {
+                    r.count += 1;
+                    r.mine |= mine;
+                    r.senders.push(sender);
+                }
+                None => reactions.push(Reaction { emoji, count: 1, mine, senders: vec![sender] }),
+            }
+        }
+        Message {
+            id: m.id,
+            chat_id: m.chat_id,
+            sender_name,
+            sender_id: m.sender_id,
+            outgoing: m.outgoing,
+            ts: m.ts,
+            text: m.text,
+            status: m.status,
+            attachment: m.attachment,
+            local_path: m.file_path.filter(|p| Path::new(p).exists()),
+            reply_to: m.reply_to,
+            link: m.link,
+            forwarded_from: m.fwd,
+            forwarded_from_id: m.fwd_id,
+            reactions,
+        }
+    }
+
+    fn chat_model(&self, row: ChatRow) -> Result<Chat> {
+        let others: Vec<MemberRow> =
+            self.store.members(&row.id)?.into_iter().filter(|m| m.member_id != self.me).collect();
+        let names = others.iter().map(|m| (m.member_id.clone(), m.name.clone())).collect();
+        let is_saved = self.saved_id().as_deref() == Some(row.id.as_str());
+        let is_group = !is_saved && (row.custom_title || others.len() > 1);
+        let title = if row.custom_title || others.is_empty() {
+            row.title.clone()
+        } else {
+            let list: Vec<&str> =
+                others.iter().map(|m| m.name.as_str()).map(|n| if n.is_empty() { "Без имени" } else { n }).collect();
+            list.join(", ")
+        };
+        let avatar = if is_group { None } else { others.first().and_then(|m| m.avatar.clone()) };
+        let mut members: Vec<Member> = others
+            .into_iter()
+            .map(|m| Member { id: m.member_id, name: m.name, avatar: m.avatar, is_me: false })
+            .collect();
+        let me = self.profile_payload()?;
+        if let Payload::Profile { name, avatar } = me {
+            members.insert(0, Member { id: self.me.clone(), name, avatar, is_me: true });
+        }
+        let is_owner = self.store.get(&owner_key(&row.id))?.is_some();
+        let backup_node = self.store.mirror(&row.id)?.map(|m| m.node);
+        let archived = self.store.get(&archive_key(&row.id))?.is_some();
+        Ok(Chat {
+            last_message: self.store.last_message(&row.id)?.map(|m| self.message_model(m, &names)),
+            id: row.id,
+            title,
+            is_group,
+            state: row.state,
+            node: row.node,
+            unread: row.unread,
+            muted: row.muted,
+            pinned: row.pinned,
+            last_ms: row.last_ms,
+            avatar,
+            members,
+            can_invite: row.state == ChatState::Active && !is_saved,
+            is_saved,
+            is_owner,
+            backup_node,
+            archived,
+        })
+    }
+
+    // ── группы ──
+
+    async fn remove_member(self: &Arc<Self>, chat_id: &str, member_id: &str) -> Result<()> {
+        if member_id == self.me {
+            return Err(Error::Other("use leave_chat to leave".into()));
+        }
+        let mut engine = self.engine.lock().await;
+        for _attempt in 0..3 {
+            let chat = self.store.chat(chat_id)?.ok_or(Error::NoChat)?;
+            let mut group = engine.group(&chat)?;
+            let Some(index) =
+                group.members().find(|m| m.credential.serialized_content() == member_id.as_bytes()).map(|m| m.index)
+            else {
+                // Уже удалён (например, кто-то успел раньше).
+                self.store.delete_member(chat_id, member_id)?;
+                return Ok(());
+            };
+            let (commit, _, _) = group.remove_members(&engine.provider, &engine.signer, &[index]).map_err(mls)?;
+            let conn = self.conn(&chat.node).await?;
+            let body = request::Body::LogCommit(LogCommit {
+                log_id: chat.log_id.clone(),
+                epoch: group.epoch().as_u64(),
+                blob: commit.tls_serialize_detached().map_err(mls)?,
+            });
+            match conn.request(body, Some(&key(&chat.write_sk))).await? {
+                response::Body::LogAppended(a) => {
+                    self.store.add_own_offset(&chat.id, a.offset)?;
+                    group.merge_pending_commit(&engine.provider).map_err(mls)?;
+                    engine.save(&self.store)?;
+                    self.store.delete_member(chat_id, member_id)?;
+                    info!("➖ member {} removed from chat {chat_id}", &member_id[..8.min(member_id.len())]);
+                    self.notify(Some(chat_id.into()));
+                    return Ok(());
+                }
+                response::Body::CommitConflict(c) => {
+                    group.clear_pending_commit(engine.provider.storage()).map_err(mls)?;
+                    engine.save(&self.store)?;
+                    if let Some(winner) = c.winner {
+                        self.process_entry(&mut engine, &chat, winner).await?;
+                    }
+                }
+                other => {
+                    group.clear_pending_commit(engine.provider.storage()).map_err(mls)?;
+                    engine.save(&self.store)?;
+                    return Err(refused(other));
+                }
+            }
+        }
+        Err(Error::Other("commit conflicts, giving up".into()))
+    }
+
+    /// Удаление из обработчика входящих: явный `Send`-тип разрывает рекурсию
+    /// remove_member → process_entry → apply_payload → remove_member.
+    fn remove_member_task(
+        self: Arc<Self>,
+        chat_id: String,
+        member_id: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        Box::pin(async move {
+            if let Err(e) = self.remove_member(&chat_id, &member_id).await {
+                warn!("⚠️ removing member who left failed: {e}");
+            }
+        })
+    }
+
+    // ── резервные журналы ──
+
+    /// Для каждого активного чата без резерва — журнал на другой ноде; ключи уходят участникам внутри MLS.
+    async fn ensure_mirrors(self: &Arc<Self>) {
+        let _guard = self.mirror_lock.lock().await;
+        let candidates = self.backup_nodes.read().unwrap().clone();
+        if candidates.is_empty() {
+            return;
+        }
+        for chat in self.store.chats().unwrap_or_default() {
+            if chat.state != ChatState::Active || self.store.mirror(&chat.id).ok().flatten().is_some() {
+                continue;
+            }
+            let chat_key = node_key(&chat.node);
+            let Some(target) = candidates.iter().find(|n| node_key(n) != chat_key) else { continue };
+            if let Err(e) = self.create_mirror(&chat, target).await {
+                debug!("mirror for chat {} on {} failed: {e}", chat.id, short(target));
+            }
+        }
+    }
+
+    async fn create_mirror(self: &Arc<Self>, chat: &ChatRow, target: &str) -> Result<()> {
+        let conn = self.conn(target).await?;
+        let (write, read) = (Ed25519Key::generate(), Ed25519Key::generate());
+        let log_id = random_bytes::<32>().to_vec();
+        let new = LogNew {
+            log_id: log_id.clone(),
+            write_pk: write.public_key().to_vec(),
+            read_pk: read.public_key().to_vec(),
+        };
+        expect_done(conn.request(request::Body::LogNew(new), None).await?)?;
+        let creds = MirrorCreds {
+            node: target.to_string(),
+            log_id,
+            write_sk: write.to_bytes().to_vec(),
+            read_sk: read.to_bytes().to_vec(),
+        };
+        // Сначала участникам: если ключи не ушли, резерв бесполезен.
+        self.send_payload(chat, &Payload::Mirror(creds.clone())).await?;
+        self.store.set_mirror(&chat.id, &mirror_row(creds))?;
+        info!("🪞 chat {} mirrored on {}", chat.id, short(target));
+        self.notify(Some(chat.id.clone()));
+        Ok(())
+    }
+
+    /// Нода чата давно молчит, а резервная отвечает — переезжаем.
+    async fn failover(self: &Arc<Self>, chat: &ChatRow) -> Result<()> {
+        let Some(mirror) = self.store.mirror(&chat.id)? else { return Ok(()) };
+        let conn = self.conn(&mirror.node).await?;
+        if self.store.swap_to_mirror(&chat.id)?.is_none() {
+            return Ok(());
+        }
+        let moved = self.store.chat(&chat.id)?.ok_or(Error::NoChat)?;
+        self.watch_chat(&conn, &moved).await?;
+        warn!("🛟 chat {} moved from {} to backup {}", chat.id, short(&chat.node), short(&mirror.node));
+        self.notify(None);
+        Ok(())
+    }
+
+    // ── сеть ──
+
+    async fn conn(self: &Arc<Self>, node: &str) -> Result<Arc<NetClient>> {
+        if let Some(c) = self.conns.lock().unwrap().get(node) {
+            return Ok(c.clone());
+        }
+        let _guard = self.connecting.lock().await;
+        if let Some(c) = self.conns.lock().unwrap().get(node) {
+            return Ok(c.clone());
+        }
+        let addr: NodeAddr = node.parse().map_err(|_| Error::Other(format!("bad node address {node}")))?;
+        let (client, mut events) =
+            tokio::time::timeout(REQUEST_TIMEOUT, NetClient::connect(&addr)).await.map_err(|_| NetError::Timeout)??;
+        let client = Arc::new(client);
+        self.conns.lock().unwrap().insert(node.to_string(), client.clone());
+        debug!("🔌 connected to {}", short(node));
+
+        // Насос событий: только пересылает в общий обработчик, чтобы не блокировать чтение ответов.
+        let (tx, weak, node_s, me) = (self.events.clone(), Arc::downgrade(self), node.to_string(), client.clone());
+        tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                if tx.send((node_s.clone(), ev)).is_err() {
+                    return;
+                }
+            }
+            if let Some(inner) = weak.upgrade() {
+                let mut conns = inner.conns.lock().unwrap();
+                if conns.get(&node_s).is_some_and(|c| Arc::ptr_eq(c, &me)) {
+                    conns.remove(&node_s);
+                }
+                debug!("🔌 disconnected from {}", short(&node_s));
+            }
+        });
+
+        self.subscribe_all(node, &client).await;
+        Ok(client)
+    }
+
+    async fn subscribe_all(&self, node: &str, conn: &NetClient) {
+        let chats = self.store.chats().unwrap_or_default();
+        for chat in chats.iter().filter(|c| c.node == node && c.state == ChatState::Active) {
+            if let Err(e) = self.watch_chat(conn, chat).await {
+                warn!("⚠️ watch chat {} failed: {e}", chat.id);
+            }
+        }
+        for table in ["invites", "joins"] {
+            for q in self.store.queues(table).unwrap_or_default().iter().filter(|q| q.node == node) {
+                if let Err(e) = subscribe_queue(conn, q).await {
+                    warn!("⚠️ queue subscribe failed: {e}");
+                }
+            }
+        }
+    }
+
+    async fn watch_chat(&self, conn: &NetClient, chat: &ChatRow) -> Result<()> {
+        let body = request::Body::LogWatch(LogWatch { log_id: chat.log_id.clone(), from_offset: chat.read_offset });
+        expect_done(conn.request(body, Some(&key(&chat.read_sk))).await?)
+    }
+
+    /// Зашифровать и положить прикладное сообщение в журнал чата.
+    async fn send_payload(self: &Arc<Self>, chat: &ChatRow, payload: &Payload) -> Result<u64> {
+        let bytes = serde_json::to_vec(payload).unwrap();
+        if bytes.len() > MAX_PAYLOAD {
+            return Err(Error::Other("message is too large".into()));
+        }
+        let conn = self.conn(&chat.node).await?;
+        let engine = self.engine.lock().await;
+        let mut group = engine.group(chat)?;
+        let out = group.create_message(&engine.provider, &engine.signer, &bytes).map_err(mls)?;
+        engine.save(&self.store)?;
+        let blob = out.tls_serialize_detached().map_err(mls)?;
+        let write = key(&chat.write_sk);
+        let resp =
+            conn.request(request::Body::LogAppend(LogAppend { log_id: chat.log_id.clone(), blob }), Some(&write));
+        match tokio::time::timeout(REQUEST_TIMEOUT, resp).await.map_err(|_| NetError::Timeout)?? {
+            response::Body::LogAppended(a) => {
+                self.store.add_own_offset(&chat.id, a.offset)?;
+                Ok(a.offset)
+            }
+            other => Err(refused(other)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn send_message(
+        self: &Arc<Self>,
+        chat_id: &str,
+        text: String,
+        attachment: Option<(AttachmentRef, PathBuf)>,
+        reply_to: Option<String>,
+        id: Option<String>,
+        link: Option<LinkPreview>,
+        fwd: Option<Forward>,
+    ) -> Result<String> {
+        let chat = self.store.chat(chat_id)?.ok_or(Error::NoChat)?;
+        if chat.state != ChatState::Active {
+            return Err(Error::NotReady);
+        }
+        let id = id.unwrap_or_else(new_id);
+        let ts = now_ms();
+        let (att, local) = match attachment {
+            Some((a, p)) => (Some(a), Some(p.to_string_lossy().into_owned())),
+            None => (None, None),
+        };
+        self.store.insert_message(&MessageRow {
+            id: id.clone(),
+            chat_id: chat_id.into(),
+            sender_id: self.me.clone(),
+            outgoing: true,
+            ts,
+            text: text.clone(),
+            attachment: att.clone(),
+            status: MessageStatus::Sending,
+            file_path: local.clone(),
+            reply_to: reply_to.clone(),
+            link: link.clone(),
+            fwd: fwd.as_ref().map(|f| f.name.clone()),
+            fwd_id: fwd.as_ref().and_then(|f| f.id.clone()),
+        })?;
+        self.store.touch_chat(chat_id, ts, 0)?;
+        self.notify(Some(chat_id.into()));
+
+        let result = async {
+            let att = match (att, &local) {
+                (Some(mut a), Some(path)) => {
+                    let conn = self.conn(&chat.node).await?;
+                    media::upload(&conn, &chat.node, Path::new(path), &mut a).await?;
+                    self.store.set_attachment(&id, &a)?;
+                    Some(a)
+                }
+                _ => None,
+            };
+            let payload = Payload::Message {
+                id: id.clone(),
+                ts,
+                text,
+                att: att.map(Box::new),
+                reply_to,
+                link: link.map(Box::new),
+                fwd_id: fwd.as_ref().and_then(|f| f.id.clone()),
+                fwd: fwd.map(|f| f.name),
+            };
+            self.send_payload(&chat, &payload).await
+        }
+        .await;
+
+        let status = if result.is_ok() { MessageStatus::Sent } else { MessageStatus::Failed };
+        self.store.set_status(&id, status)?;
+        if local.is_some() {
+            self.enforce_cache_limit(local.as_deref())?;
+        }
+        self.notify(Some(chat_id.into()));
+        result.map(|_| id)
+    }
+
+    fn saved_id(&self) -> Option<String> {
+        self.store.get(SAVED_CHAT_KEY).ok().flatten().and_then(|v| String::from_utf8(v).ok())
+    }
+
+    fn media_settings(&self) -> MediaSettings {
+        self.store
+            .get(MEDIA_SETTINGS_KEY)
+            .ok()
+            .flatten()
+            .and_then(|v| serde_json::from_slice(&v).ok())
+            .unwrap_or_default()
+    }
+
+    /// Удалять самые старые файлы, пока кэш больше предела. `keep` — только что полученный файл.
+    fn enforce_cache_limit(&self, keep: Option<&str>) -> Result<u64> {
+        let limit = self.media_settings().cache_limit_bytes;
+        if limit == 0 {
+            return Ok(0);
+        }
+        let files: Vec<(String, u64)> = self
+            .store
+            .media_files_by_age()?
+            .into_iter()
+            .map(|p| {
+                let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+                (p, size)
+            })
+            .collect();
+        let mut total: u64 = files.iter().map(|f| f.1).sum();
+        let mut freed = 0;
+        for (path, size) in files {
+            if total <= limit {
+                break;
+            }
+            if Some(path.as_str()) == keep {
+                continue;
+            }
+            let _ = std::fs::remove_file(&path);
+            self.store.clear_file_paths_for(&path)?;
+            total -= size;
+            freed += size;
+        }
+        if freed > 0 {
+            info!("🧹 cache limit: freed {freed} bytes");
+            self.notify(None);
+        }
+        Ok(freed)
+    }
+
+    async fn download(self: &Arc<Self>, message_id: &str) -> Result<String> {
+        let m = self.store.message(message_id)?.ok_or(Error::Other("message not found".into()))?;
+        if let Some(p) = m.file_path.as_ref().filter(|p| Path::new(p).exists()) {
+            return Ok(p.clone());
+        }
+        let a = m.attachment.ok_or(Error::Other("no attachment".into()))?;
+        if !self.downloading.lock().unwrap().insert(message_id.to_string()) {
+            return Err(Error::Other("already downloading".into()));
+        }
+        let result = async {
+            let conn = self.conn(&a.node).await?;
+            let ext = Path::new(&a.name).extension().and_then(|e| e.to_str()).unwrap_or("bin");
+            let path = self.dir.join("media").join(format!("{}.{ext}", m.id));
+            media::download(&conn, &a, &path).await?;
+            let path = path.to_string_lossy().into_owned();
+            self.store.set_file_path(&m.id, Some(&path))?;
+            self.enforce_cache_limit(Some(&path))?;
+            Ok(path)
+        }
+        .await;
+        self.downloading.lock().unwrap().remove(message_id);
+        self.notify(Some(m.chat_id));
+        result
+    }
+
+    // ── обработка входящего ──
+
+    async fn handle_event(self: &Arc<Self>, node: &str, ev: Event) -> Result<()> {
+        match ev.body {
+            Some(event::Body::LogEvent(e)) => {
+                let Some(entry) = e.entry else { return Ok(()) };
+                if let Some(chat) = self.store.chat_by_log(&e.log_id)? {
+                    let mut engine = self.engine.lock().await;
+                    self.process_entry(&mut engine, &chat, entry).await?;
+                }
+            }
+            Some(event::Body::QueueMessage(m)) => {
+                let invite = self.store.queues("invites")?.into_iter().find(|q| q.recipient_id == m.recipient_id);
+                let join = self.store.queues("joins")?.into_iter().find(|q| q.recipient_id == m.recipient_id);
+                let (q, res) = match (invite, join) {
+                    (Some(q), _) => {
+                        let r = self.handle_join_request(&q, &m.body).await;
+                        (q, r)
+                    }
+                    (_, Some(q)) => {
+                        let r = self.handle_join_reply(&q, &m.body).await;
+                        (q, r)
+                    }
+                    _ => return Ok(()),
+                };
+                if let Err(e) = &res {
+                    warn!("⚠️ queue message in chat {} dropped: {e}", q.chat_id);
+                }
+                let conn = self.conn(node).await?;
+                let ack = QueueAck { recipient_id: q.recipient_id.clone(), msg_id: m.msg_id };
+                conn.request(request::Body::QueueAck(ack), Some(&key(&q.recipient_sk))).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Мы пригласили — кто-то прислал KeyPackage. Добавляем в группу и отвечаем Welcome.
+    async fn handle_join_request(self: &Arc<Self>, invite: &QueueRow, body: &[u8]) -> Result<()> {
+        let req: JoinRequest = serde_json::from_slice(body).map_err(|e| Error::Other(e.to_string()))?;
+        let mut engine = self.engine.lock().await;
+        let key_package = KeyPackageIn::tls_deserialize_exact(&req.key_package)
+            .map_err(mls)?
+            .validate(engine.provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(mls)?;
+
+        for _attempt in 0..3 {
+            let chat = self.store.chat(&invite.chat_id)?.ok_or(Error::NoChat)?;
+            let mut group = engine.group(&chat)?;
+            let others = group.members().count() > 1;
+            let (commit, welcome, _) =
+                group.add_members(&engine.provider, &engine.signer, std::slice::from_ref(&key_package)).map_err(mls)?;
+
+            let mut from_offset = chat.read_offset;
+            if others {
+                // Коммит виден остальным участникам — публикуем через compare-and-swap по эпохе.
+                let conn = self.conn(&chat.node).await?;
+                let blob = commit.tls_serialize_detached().map_err(mls)?;
+                let body = request::Body::LogCommit(LogCommit {
+                    log_id: chat.log_id.clone(),
+                    epoch: group.epoch().as_u64(),
+                    blob,
+                });
+                match conn.request(body, Some(&key(&chat.write_sk))).await? {
+                    response::Body::LogAppended(a) => {
+                        self.store.add_own_offset(&chat.id, a.offset)?;
+                        from_offset = from_offset.max(a.offset + 1);
+                    }
+                    response::Body::CommitConflict(c) => {
+                        // Кто-то успел раньше: откатываем свой коммит, применяем победителя и пробуем снова.
+                        group.clear_pending_commit(engine.provider.storage()).map_err(mls)?;
+                        engine.save(&self.store)?;
+                        if let Some(winner) = c.winner {
+                            self.process_entry(&mut engine, &chat, winner).await?;
+                        }
+                        continue;
+                    }
+                    other => {
+                        group.clear_pending_commit(engine.provider.storage()).map_err(mls)?;
+                        engine.save(&self.store)?;
+                        return Err(refused(other));
+                    }
+                }
+            }
+            group.merge_pending_commit(&engine.provider).map_err(mls)?;
+            engine.save(&self.store)?;
+
+            let creds = LogCreds {
+                log_id: chat.log_id.clone(),
+                write_sk: chat.write_sk.clone(),
+                read_sk: chat.read_sk.clone(),
+                from_offset,
+            };
+            let sealed = seal(&engine.creds_key(&group)?, &serde_json::to_vec(&creds).unwrap());
+            let reply = JoinReply { welcome: welcome.tls_serialize_detached().map_err(mls)?, creds: sealed };
+            drop(engine);
+
+            let conn = self.conn(&invite.node).await?;
+            let body = serde_json::to_vec(&reply).unwrap();
+            expect_done(conn.request(request::Body::QueueSend(QueueSend { sender_id: req.reply, body }), None).await?)?;
+            info!("➕ member added to chat {}", chat.id);
+            // Новичок не видит сообщений до своего вступления — представимся заново.
+            let _ = self.send_payload(&chat, &self.profile_payload()?).await;
+            if chat.custom_title {
+                let _ = self.send_payload(&chat, &Payload::Title { title: chat.title.clone() }).await;
+            }
+            self.notify(Some(chat.id));
+            return Ok(());
+        }
+        Err(Error::Other("commit conflicts, giving up".into()))
+    }
+
+    /// Мы вступали — пришёл Welcome. Входим в группу и подписываемся на журнал.
+    async fn handle_join_reply(self: &Arc<Self>, join: &QueueRow, body: &[u8]) -> Result<()> {
+        let reply: JoinReply = serde_json::from_slice(body).map_err(|e| Error::Other(e.to_string()))?;
+        let engine = self.engine.lock().await;
+        let welcome = match MlsMessageIn::tls_deserialize_exact(&reply.welcome).map_err(mls)?.extract() {
+            MlsMessageBodyIn::Welcome(w) => w,
+            _ => return Err(Error::Mls("expected Welcome".into())),
+        };
+        let group = StagedWelcome::new_from_welcome(&engine.provider, &Engine::join_config(), welcome, None)
+            .map_err(mls)?
+            .into_group(&engine.provider)
+            .map_err(mls)?;
+        let creds: LogCreds = serde_json::from_slice(&open(&engine.creds_key(&group)?, &reply.creds)?)
+            .map_err(|e| Error::Other(e.to_string()))?;
+        engine.save(&self.store)?;
+        drop(engine);
+
+        self.store.activate_chat(
+            &join.chat_id,
+            group.group_id().as_slice(),
+            &creds.log_id,
+            &creds.write_sk,
+            &creds.read_sk,
+            creds.from_offset,
+        )?;
+        let conn = self.conn(&join.node).await?;
+        let _ = conn
+            .request(
+                request::Body::QueueDel(QueueDel { recipient_id: join.recipient_id.clone() }),
+                Some(&key(&join.recipient_sk)),
+            )
+            .await;
+        self.store.delete_queue("joins", &join.chat_id)?;
+        let chat = self.store.chat(&join.chat_id)?.ok_or(Error::NoChat)?;
+        self.watch_chat(&conn, &chat).await?;
+        info!("✅ joined chat {}", chat.id);
+        let _ = self.send_payload(&chat, &self.profile_payload()?).await;
+        self.notify(None);
+        Ok(())
+    }
+
+    async fn process_entry(self: &Arc<Self>, engine: &mut Engine, chat: &ChatRow, entry: LogEntry) -> Result<()> {
+        // Читаем текущее смещение заново: событие могло прийти повторно после переподписки.
+        let chat = self.store.chat(&chat.id)?.ok_or(Error::NoChat)?;
+        if entry.offset < chat.read_offset {
+            return Ok(());
+        }
+        self.store.set_read_offset(&chat.id, entry.offset + 1)?;
+        if self.store.is_own_offset(&chat.id, entry.offset)? {
+            return Ok(());
+        }
+        let mut group = engine.group(&chat)?;
+        let processed = MlsMessageIn::tls_deserialize_exact(&entry.blob)
+            .map_err(mls)
+            .and_then(|m| m.try_into_protocol_message().map_err(mls))
+            .and_then(|m| group.process_message(&engine.provider, m).map_err(mls));
+        let processed = match processed {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("skip entry {} in chat {}: {e}", entry.offset, chat.id);
+                return Ok(());
+            }
+        };
+        let sender = String::from_utf8_lossy(processed.credential().serialized_content()).into_owned();
+        match processed.into_content() {
+            ProcessedMessageContent::ApplicationMessage(app) => {
+                engine.save(&self.store)?;
+                if let Ok(payload) = serde_json::from_slice::<Payload>(&app.into_bytes()) {
+                    self.apply_payload(&chat, &sender, payload, engine).await?;
+                }
+            }
+            ProcessedMessageContent::StagedCommitMessage(commit) => {
+                let removed = commit.self_removed();
+                let added = commit.add_proposals().count() > 0;
+                let gone: Vec<String> = commit
+                    .remove_proposals()
+                    .filter_map(|p| group.member(p.remove_proposal().removed()).cloned())
+                    .map(|c| String::from_utf8_lossy(c.serialized_content()).into_owned())
+                    .collect();
+                group.merge_staged_commit(&engine.provider, *commit).map_err(mls)?;
+                engine.save(&self.store)?;
+                for id in gone {
+                    self.store.delete_member(&chat.id, &id)?;
+                }
+                if removed {
+                    self.store.set_chat_state(&chat.id, ChatState::Left)?;
+                    self.notify(None);
+                } else if added {
+                    // Представиться новичку (он не видит прошлых сообщений) — уже вне замка.
+                    let (inner, chat) = (self.clone(), chat.clone());
+                    tokio::spawn(async move {
+                        if let Ok(p) = inner.profile_payload() {
+                            let _ = inner.send_payload(&chat, &p).await;
+                        }
+                    });
+                }
+            }
+            ProcessedMessageContent::ProposalMessage(p) => {
+                group.store_pending_proposal(engine.provider.storage(), *p).map_err(mls)?;
+                engine.save(&self.store)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Отчёт о доставке — с небольшой задержкой, одним на пачку (догоняя историю, не шлём по отчёту на сообщение).
+    fn schedule_delivery_receipt(self: &Arc<Self>, chat_id: &str) {
+        if !self.delivery_pending.lock().unwrap().insert(chat_id.to_string()) {
+            return;
+        }
+        let (inner, chat_id) = (self.clone(), chat_id.to_string());
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            inner.delivery_pending.lock().unwrap().remove(&chat_id);
+            let Ok(Some(chat)) = inner.store.chat(&chat_id) else { return };
+            if chat.state != ChatState::Active {
+                return;
+            }
+            let Ok(up_to) = inner.store.max_incoming_ts(&chat_id) else { return };
+            if let Err(e) = inner.send_payload(&chat, &Payload::Delivered { up_to }).await {
+                warn!("⚠️ delivery receipt failed: {e}");
+            }
+        });
+    }
+
+    async fn apply_payload(
+        self: &Arc<Self>,
+        chat: &ChatRow,
+        sender: &str,
+        payload: Payload,
+        engine: &Engine,
+    ) -> Result<()> {
+        match payload {
+            Payload::Message { id, ts, text, att, reply_to, link, fwd, fwd_id } => {
+                let settings = self.media_settings();
+                let auto = att.as_ref().is_some_and(|a| settings.auto_download(a));
+                let inserted = self.store.insert_message(&MessageRow {
+                    id: id.clone(),
+                    chat_id: chat.id.clone(),
+                    sender_id: sender.into(),
+                    outgoing: false,
+                    ts,
+                    text,
+                    attachment: att.map(|a| *a),
+                    status: MessageStatus::Received,
+                    file_path: None,
+                    reply_to,
+                    link: link.and_then(|l| l.sanitized()),
+                    fwd: fwd.map(|f| f.chars().take(64).collect()),
+                    fwd_id: fwd_id.filter(|k| Forward::valid_id(k)),
+                })?;
+                if inserted {
+                    self.store.touch_chat(&chat.id, ts.max(now_ms().min(ts + 60_000)), 1)?;
+                    self.schedule_delivery_receipt(&chat.id);
+                    // Как в Telegram: новое сообщение достаёт чат из архива, если он не заглушён.
+                    if !chat.muted {
+                        self.store.delete(&archive_key(&chat.id))?;
+                    }
+                    if auto {
+                        let inner = self.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = inner.download(&id).await {
+                                warn!("⚠️ auto-download failed: {e}");
+                            }
+                        });
+                    }
+                }
+            }
+            Payload::Profile { name, avatar } => {
+                self.store.upsert_member(&chat.id, sender, &name, avatar.as_deref())?;
+            }
+            Payload::Title { title } => {
+                self.store.set_title(&chat.id, &title, !title.is_empty())?;
+            }
+            Payload::Read { up_to } => {
+                self.store.mark_outgoing_read(&chat.id, up_to)?;
+            }
+            Payload::Typing { kind, ts } => {
+                // Догоняя историю, старые «печатает…» не показываем.
+                if sender != self.me && now_ms().saturating_sub(ts) < TYPING_FRESH_MS {
+                    if let Some(l) = self.listener.read().unwrap().clone() {
+                        l.typing(chat.id.clone(), sender.to_string(), kind);
+                    }
+                }
+            }
+            Payload::Delivered { up_to } => {
+                self.store.mark_outgoing_delivered(&chat.id, up_to)?;
+            }
+            Payload::Mirror(creds) => {
+                if node_key(&creds.node) != node_key(&chat.node) {
+                    self.store.set_mirror(&chat.id, &mirror_row(creds))?;
+                }
+            }
+            Payload::Leave => {
+                // Удаляет один, детерминированно: участник с наименьшим id среди оставшихся.
+                let group = engine.group(chat)?;
+                let remover = group
+                    .members()
+                    .map(|m| String::from_utf8_lossy(m.credential.serialized_content()).into_owned())
+                    .filter(|id| id != sender)
+                    .min();
+                if remover.as_deref() == Some(self.me.as_str()) {
+                    tokio::spawn(self.clone().remove_member_task(chat.id.clone(), sender.to_string()));
+                }
+            }
+            Payload::React { id, emoji } => {
+                let emoji = Some(emoji.trim()).filter(|e| !e.is_empty() && e.len() <= MAX_REACTION_BYTES);
+                if self.store.message(&id)?.is_some_and(|m| m.chat_id == chat.id) {
+                    self.store.set_reaction(&id, sender, emoji, now_ms())?;
+                }
+            }
+            Payload::Delete { id } => {
+                if let Some(m) = self.store.message(&id)?.filter(|m| m.sender_id == sender && m.chat_id == chat.id) {
+                    if let Some(p) = m.file_path {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    self.store.delete_message(&id)?;
+                }
+            }
+        }
+        self.notify(Some(chat.id.clone()));
+        Ok(())
+    }
+}
+
+async fn event_worker(inner: std::sync::Weak<Inner>, mut rx: mpsc::UnboundedReceiver<(String, Event)>) {
+    while let Some((node, ev)) = rx.recv().await {
+        let Some(inner) = inner.upgrade() else { return };
+        if let Err(e) = inner.handle_event(&node, ev).await {
+            warn!("⚠️ event handling failed: {e}");
+        }
+    }
+}
+
+/// Держит соединения со всеми нодами, где есть наши чаты и очереди; после обрыва переподписывается.
+async fn reconnect_loop(inner: std::sync::Weak<Inner>) {
+    loop {
+        {
+            let Some(inner) = inner.upgrade() else { return };
+            let mut nodes: Vec<String> = inner.store.chats().unwrap_or_default().into_iter().map(|c| c.node).collect();
+            for table in ["invites", "joins"] {
+                nodes.extend(inner.store.queues(table).unwrap_or_default().into_iter().map(|q| q.node));
+            }
+            nodes.sort();
+            nodes.dedup();
+            for node in nodes {
+                let connected = inner.conns.lock().unwrap().contains_key(&node);
+                if !connected {
+                    match inner.conn(&node).await {
+                        Ok(_) => {
+                            inner.down_since.lock().unwrap().remove(&node);
+                        }
+                        Err(e) => {
+                            debug!("reconnect to {} failed: {e}", short(&node));
+                            inner.down_since.lock().unwrap().entry(node).or_insert_with(Instant::now);
+                        }
+                    }
+                } else {
+                    inner.down_since.lock().unwrap().remove(&node);
+                }
+            }
+            // Нода чата пропала надолго — переезд на резервный журнал.
+            let after = *inner.failover_after.read().unwrap();
+            let dead: Vec<String> = inner
+                .down_since
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, since)| since.elapsed() >= after)
+                .map(|(n, _)| n.clone())
+                .collect();
+            for chat in inner.store.chats().unwrap_or_default() {
+                if chat.state == ChatState::Active && dead.contains(&chat.node) {
+                    if let Err(e) = inner.failover(&chat).await {
+                        debug!("failover of chat {} failed: {e}", chat.id);
+                    }
+                }
+            }
+            // После переезда у чата снова нет резерва — заводим новый.
+            if !dead.is_empty() {
+                inner.ensure_mirrors().await;
+            }
+        }
+        tokio::time::sleep(RECONNECT_EVERY).await;
+    }
+}
+
+async fn new_queue(conn: &NetClient, chat_id: &str, node: &str) -> Result<QueueRow> {
+    let recipient = Ed25519Key::generate();
+    match conn
+        .request(request::Body::QueueNew(QueueNew { recipient_auth_pk: recipient.public_key().to_vec() }), None)
+        .await?
+    {
+        response::Body::QueueCreated(q) => Ok(QueueRow {
+            chat_id: chat_id.into(),
+            node: node.into(),
+            recipient_id: q.recipient_id,
+            recipient_sk: recipient.to_bytes().to_vec(),
+            sender_id: q.sender_id,
+        }),
+        other => Err(refused(other)),
+    }
+}
+
+async fn subscribe_queue(conn: &NetClient, q: &QueueRow) -> Result<()> {
+    let body = request::Body::QueueSub(QueueSub { recipient_id: q.recipient_id.clone() });
+    expect_done(conn.request(body, Some(&key(&q.recipient_sk))).await?)
+}
+
+fn expect_done(resp: response::Body) -> Result<()> {
+    match resp {
+        response::Body::Done(_) => Ok(()),
+        other => Err(refused(other)),
+    }
+}
+
+fn refused(resp: response::Body) -> Error {
+    Error::Node(format!("unexpected response {resp:?}").chars().take(200).collect())
+}
+
+/// «Печатает…» старше этого — уже неактуально.
+const TYPING_FRESH_MS: u64 = 10_000;
+
+fn archive_key(chat_id: &str) -> String {
+    format!("archived:{chat_id}")
+}
+
+fn owner_key(chat_id: &str) -> String {
+    format!("owner:{chat_id}")
+}
+
+fn mirror_row(c: MirrorCreds) -> MirrorRow {
+    MirrorRow { node: c.node, log_id: c.log_id, write_sk: c.write_sk, read_sk: c.read_sk, read_offset: 0 }
+}
+
+/// Одна и та же нода может быть записана разными адресами — сравниваем по ключу.
+fn node_key(node: &str) -> String {
+    node.parse::<NodeAddr>().map(|a| hex::encode(a.public_key)).unwrap_or_else(|_| node.to_string())
+}
+
+fn short(node: &str) -> String {
+    node.rsplit('@').next().unwrap_or(node).to_string()
+}

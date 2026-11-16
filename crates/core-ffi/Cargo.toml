@@ -1,0 +1,25 @@
+[package]
+name = "core-ffi"
+description = "Мост Rust → Swift/Kotlin (UniFFI) для приложений CORE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["lib", "staticlib", "cdylib"]
+name = "core_ffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+
+[dependencies]
+core-client.workspace = true
+core-crypto.workspace = true
+core-directory.workspace = true
+core-net.workspace = true
+core-proto.workspace = true
+hex.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+uniffi = { version = "0.28.3", features = ["cli", "tokio"] }

@@ -1,0 +1,90 @@
+# Быстрый запуск ноды CORE — подробно в README.md, раздел «Развёртывание».
+#
+#   cp .env.example .env       # укажите CORE_PUBLIC_HOST (и при желании CORE_BOOTSTRAP)
+#   docker compose up -d
+#   docker compose exec node core-node info     # адрес ноды для клиентов и других нод
+#
+# Локальная тестовая сеть из 3 связанных нод:
+#   docker compose --profile testnet up -d
+
+x-node: &node
+  build: .
+  image: ${CORE_IMAGE:-core-node:local}
+  restart: unless-stopped
+  ulimits:
+    nofile: { soft: 65536, hard: 65536 }
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  node:
+    <<: *node
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      CORE_PUBLIC_HOST: ${CORE_PUBLIC_HOST:-127.0.0.1:7443}
+      CORE_BOOTSTRAP: ${CORE_BOOTSTRAP:-}
+      CORE_NAME: ${CORE_NAME:-}
+      CORE_REGION: ${CORE_REGION:-}
+    ports:
+      - "${CORE_PORT:-7443}:7443"
+    volumes:
+      - node-data:/data
+
+  # ── Testnet ────────────────────────────────────────────────────────────────
+  # Ключи выводятся из публичных зёрен (CORE_IDENTITY_SEED) — адреса известны заранее,
+  # поэтому ноды могут указать друг друга в bootstrap. НИКОГДА не используйте зёрна в бою.
+  #
+  # Каждая нода объявляет два адреса:
+  #   127.0.0.1:1744N  — для клиентов на хосте (приложение, core-cli);
+  #   testnet-N:7443   — для других нод внутри docker-сети.
+  # Регионы условные — чтобы карта сети выглядела как настоящая.
+
+  testnet-1:
+    <<: *node
+    profiles: [testnet]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      CORE_IDENTITY_SEED: core-testnet-1
+      CORE_PUBLIC_HOST: 127.0.0.1:17441
+      CORE_EXTRA_ADDRESSES: testnet-1:7443
+      CORE_NAME: Alpha
+      CORE_REGION: NL
+      CORE_BOOTSTRAP: core://710910b6e3dc90c3200e0a71372b738ae83e57499e27596830f5cf70a4eaf706@testnet-2:7443
+    ports: ["17441:7443"]
+    volumes: [testnet-1:/data]
+
+  testnet-2:
+    <<: *node
+    profiles: [testnet]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      CORE_IDENTITY_SEED: core-testnet-2
+      CORE_PUBLIC_HOST: 127.0.0.1:17442
+      CORE_EXTRA_ADDRESSES: testnet-2:7443
+      CORE_NAME: Bravo
+      CORE_REGION: DE
+      CORE_BOOTSTRAP: core://eaf9b12457fda0aade8aa28641f3117a20d3238b5dc0687cb0f7fc58ea251b61@testnet-1:7443
+    ports: ["17442:7443"]
+    volumes: [testnet-2:/data]
+
+  testnet-3:
+    <<: *node
+    profiles: [testnet]
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+      CORE_IDENTITY_SEED: core-testnet-3
+      CORE_PUBLIC_HOST: 127.0.0.1:17443
+      CORE_EXTRA_ADDRESSES: testnet-3:7443
+      CORE_NAME: Charlie
+      CORE_REGION: FI
+      # Знает только о Bravo — об Alpha узнает через gossip.
+      CORE_BOOTSTRAP: core://710910b6e3dc90c3200e0a71372b738ae83e57499e27596830f5cf70a4eaf706@testnet-2:7443
+    ports: ["17443:7443"]
+    volumes: [testnet-3:/data]
+
+volumes:
+  node-data:
+  testnet-1:
+  testnet-2:
+  testnet-3:

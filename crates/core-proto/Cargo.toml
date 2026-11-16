@@ -1,0 +1,10 @@
+[package]
+name = "core-proto"
+description = "Wire protocol CORE: кадры фиксированного размера и сообщения (protobuf)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+prost.workspace = true
+thiserror.workspace = true

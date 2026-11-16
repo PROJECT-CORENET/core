@@ -1,0 +1,225 @@
+name: deploy
+
+# Развёртывание сети нод на своих серверах (self-hosted раннеры с метками proxy / nl / vn / imirjar).
+#
+# Компиляция — только на бесплатных раннерах GitHub (workflow `node`, ubuntu-latest → образ в GHCR).
+# Серверы ничего не собирают: скачивают готовый образ и перезапускают контейнер.
+#
+# Запускается сам после успешного workflow `node` на main (образ уже в GHCR)
+# или вручную: Actions → deploy → Run workflow (можно указать тег образа).
+#
+# Ключи каждой ноды создаются при первом запуске и живут в docker-томе `core-node-data` на сервере —
+# адрес ноды не меняется между развёртываниями. Bootstrap собирается сам: каждая нода знает адреса всех остальных.
+
+on:
+  workflow_run:
+    workflows: [node]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Тег образа ghcr.io/<owner>/core-node (latest, sha-xxxxxxx, 0.1.0 …)
+        default: latest
+        required: true
+
+# Развёртывания идут строго по очереди и не прерывают друг друга на полпути.
+concurrency:
+  group: deploy-network
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/core-node
+  # Тег: ручной запуск — из формы, автоматический — образ ровно того коммита, что прошёл `node`.
+  TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || format('sha-{0}', github.event.workflow_run.head_sha) }}
+  CONTAINER: core-node
+  VOLUME: core-node-data
+  # Порт внутри контейнера (см. Dockerfile); снаружи — порт из списка нод.
+  INNER_PORT: "7443"
+
+jobs:
+  # 1. Поднять образ и получить адрес каждой ноды (ключи создаются в томе при первом запуске).
+  identity:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        include: &nodes
+          - { runner: proxy,   name: N1, region: RU, host: "188.225.72.79:7445" }
+          - { runner: nl,      name: N2, region: NL, host: "141.98.235.172:7445" }
+          - { runner: vn,      name: N3, region: RU, host: "213.171.4.253:7445" }
+          - { runner: imirjar, name: I1, region: RU, host: "91.215.121.220:7445" }
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    name: identity ${{ matrix.name }}
+    steps:
+      - name: Image tag
+        id: tag
+        # sha-<полный> → sha-<7 символов>, как его называет docker/metadata-action.
+        run: |
+          tag="$TAG"
+          case "$tag" in sha-*) tag="sha-$(echo "${tag#sha-}" | cut -c1-7)";; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "🏷️ image $IMAGE:$tag"
+
+      - name: Login to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Pull image
+        run: docker pull "$IMAGE:${{ steps.tag.outputs.tag }}"
+
+      - name: Node address
+        run: |
+          docker volume create "$VOLUME" >/dev/null
+          docker run --rm -v "$VOLUME:/data" -e CORE_PUBLIC_HOST="${{ matrix.host }}" \
+            "$IMAGE:${{ steps.tag.outputs.tag }}" info | tee info.txt
+          addr=$(sed -n 's/^address: //p' info.txt)
+          [ -n "$addr" ] || { echo "❌ no address in core-node info"; exit 1; }
+          mkdir -p out
+          echo "$addr" > "out/${{ matrix.name }}.addr"
+          echo "🆔 ${{ matrix.name }} → $addr"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: addr-${{ matrix.name }}
+          path: out/${{ matrix.name }}.addr
+          retention-days: 7
+
+  # 2. Запустить ноды: bootstrap — все остальные ноды сети.
+  run:
+    needs: identity
+    strategy:
+      fail-fast: false
+      matrix:
+        include: *nodes
+    runs-on: [self-hosted, "${{ matrix.runner }}"]
+    name: run ${{ matrix.name }}
+    steps:
+      - name: Image tag
+        id: tag
+        run: |
+          tag="$TAG"
+          case "$tag" in sha-*) tag="sha-$(echo "${tag#sha-}" | cut -c1-7)";; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: addr-*
+          path: addrs
+          merge-multiple: true
+
+      - name: Bootstrap list
+        id: boot
+        run: |
+          own=$(cat "addrs/${{ matrix.name }}.addr")
+          boot=$(cat addrs/*.addr | grep -vxF "$own" | paste -sd, -)
+          echo "list=$boot" >> "$GITHUB_OUTPUT"
+          echo "🔗 ${{ matrix.name }} bootstrap: $boot"
+
+      - name: Start node
+        run: |
+          port="${{ matrix.host }}"; port="${port##*:}"
+          docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+          docker run -d --name "$CONTAINER" \
+            --restart unless-stopped \
+            --ulimit nofile=65536:65536 \
+            --log-driver json-file --log-opt max-size=10m --log-opt max-file=3 \
+            -p "$port:$INNER_PORT" \
+            -v "$VOLUME:/data" \
+            -e RUST_LOG=info \
+            -e CORE_PUBLIC_HOST="${{ matrix.host }}" \
+            -e CORE_NAME="${{ matrix.name }}" \
+            -e CORE_REGION="${{ matrix.region }}" \
+            -e CORE_BOOTSTRAP="${{ steps.boot.outputs.list }}" \
+            "$IMAGE:${{ steps.tag.outputs.tag }}" run
+          echo "🚀 ${{ matrix.name }} started on :$port"
+
+      - name: Wait for healthy
+        run: |
+          for i in $(seq 1 30); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' "$CONTAINER")
+            [ "$status" = healthy ] && { echo "✅ ${{ matrix.name }} healthy"; exit 0; }
+            [ "$(docker inspect -f '{{.State.Running}}' "$CONTAINER")" = true ] || break
+            sleep 3
+          done
+          echo "❌ ${{ matrix.name }} is not healthy (status: $status)"
+          docker logs --tail 200 "$CONTAINER"
+          exit 1
+
+      - name: Clean old images
+        if: always()
+        run: docker image prune -f --filter "until=168h" >/dev/null || true
+
+  # 3. Проверка снаружи: каждая нода отвечает по публичному адресу; готовый nodes.json для приложения.
+  verify:
+    needs: run
+    runs-on: [self-hosted, proxy]
+    steps:
+      - name: Image tag
+        id: tag
+        run: |
+          tag="$TAG"
+          case "$tag" in sha-*) tag="sha-$(echo "${tag#sha-}" | cut -c1-7)";; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: addr-*
+          path: addrs
+          merge-multiple: true
+
+      - name: Ping every node by public address
+        run: |
+          failed=0
+          {
+            echo "### Сеть CORE"
+            echo
+            echo "| Нода | Адрес | Пинг |"
+            echo "| --- | --- | --- |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          for f in addrs/*.addr; do
+            name=$(basename "$f" .addr); addr=$(cat "$f")
+            if out=$(docker run --rm --entrypoint core-cli "$IMAGE:${{ steps.tag.outputs.tag }}" ping --count 3 "$addr" 2>&1); then
+              echo "✅ $name: $out"
+              result="✅"
+            else
+              echo "❌ $name unreachable: $out"
+              result="❌ недоступна"
+              failed=1
+            fi
+            echo "| $name | \`$addr\` | $result |" >> "$GITHUB_STEP_SUMMARY"
+          done
+          exit $failed
+
+      - name: nodes.json
+        if: always()
+        run: |
+          mkdir -p out
+          {
+            echo "["
+            first=1
+            for f in addrs/*.addr; do
+              [ $first = 1 ] || echo ","
+              first=0
+              printf '  {"name": "%s", "address": "%s"}' "$(basename "$f" .addr)" "$(cat "$f")"
+            done
+            echo
+            echo "]"
+          } > out/nodes.json
+          cat out/nodes.json
+          {
+            echo
+            echo "Список для приложения (\`PROJECT-CORENET/nodes/nodes.json\`):"
+            echo '```json'
+            cat out/nodes.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nodes-json
+          path: out/nodes.json

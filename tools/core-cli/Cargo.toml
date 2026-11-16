@@ -1,0 +1,16 @@
+[package]
+name = "core-cli"
+description = "CLI-клиент CORE для разработки и проверки нод"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+core-crypto.workspace = true
+core-directory.workspace = true
+core-net.workspace = true
+core-proto.workspace = true
+hex.workspace = true
+tokio.workspace = true

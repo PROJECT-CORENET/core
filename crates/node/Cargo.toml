@@ -1,0 +1,31 @@
+[package]
+name = "core-node"
+description = "Нода сети CORE: mailbox (очереди и журналы)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "core-node"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+core-crypto.workspace = true
+core-directory.workspace = true
+core-net.workspace = true
+core-proto.workspace = true
+hex.workspace = true
+prost.workspace = true
+rand.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

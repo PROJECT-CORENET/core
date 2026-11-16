@@ -1,0 +1,12 @@
+[package]
+name = "core-directory"
+description = "Каталог нод CORE: подписанные дескрипторы, статистика, снимки сети"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core-crypto.workspace = true
+core-proto.workspace = true
+prost.workspace = true
+thiserror.workspace = true
