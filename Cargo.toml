@@ -30,7 +30,7 @@ ed25519-dalek = { version = "2.1", features = ["rand_core"] }
 hex = "0.4"
 prost = "0.13"
 rand = "0.8"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.43", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 snow = "0.9.6"

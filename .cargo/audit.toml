@@ -1,0 +1,19 @@
+# Настройки `cargo audit` (читается автоматически из .cargo/audit.toml).
+#
+# Игнорируем только то, что приходит транзитивно через OpenMLS 0.9.2 / openmls_rust_crypto 0.6
+# (последние версии на 2026-11-16) и не исполняется в нашем коде.
+# Пересмотреть при каждом обновлении OpenMLS — и удалить, как только исправленные версии станут доступны.
+
+[advisories]
+ignore = [
+    # crypto-bigint 0.5.5: неконстантное время в части операций. Используется только в P-256/P-384
+    # (elliptic-curve 0.13 ← p256/p384 ← openmls_rust_crypto, hpke-rs-rust-crypto). Наш набор MLS —
+    # MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 (core-client/src/lib.rs), кривые NIST не вызываются.
+    # Исправление (>=0.7.6) требует elliptic-curve 0.14, на которую openmls_rust_crypto 0.6 ещё не перешёл.
+    "RUSTSEC-2026-0387",
+    # libcrux-kem 0.0.9: паники на коротких seed/ключах гибридного KEM. Попадает в Cargo.lock как
+    # необязательная зависимость hpke-rs 0.7 (бэкенд libcrux), но не включена и не компилируется
+    # (`cargo tree -i libcrux-kem --target all` пуст). hpke-rs 0.7 требует ровно hpke-rs-libcrux =0.7.0.
+    "RUSTSEC-2026-0330",
+    "RUSTSEC-2026-0331",
+]

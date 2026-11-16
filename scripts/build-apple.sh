@@ -24,6 +24,9 @@ else
 fi
 # MACOSX_DEPLOYMENT_TARGET не задаём: с ним ld из Xcode 27 собирает proc-macro dylib, которые
 # не загружаются (mis-aligned LINKEDIT). Минимальная версия по умолчанию ниже 26 — линкуется без проблем.
+# iOS — наоборот, задаём как у приложения: C-часть SQLCipher (cc) собирается под свежий SDK
+# и зовёт ___chkstk_darwin, которого нет в libSystem для iOS 10 (минимум rustc по умолчанию).
+export IPHONEOS_DEPLOYMENT_TARGET="${IPHONEOS_DEPLOYMENT_TARGET:-26.0}"
 
 cd "$CORE_DIR"
 PROFILE_DIR="$PROFILE"
