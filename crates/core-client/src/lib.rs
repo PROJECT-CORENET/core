@@ -8,9 +8,11 @@
 //!    отвечает Welcome + ключами журнала, зашифрованными экспортёром MLS новой эпохи.
 //! 4. Сообщения — MLS application messages в журнале; нода видит только шифротекст.
 
+mod link;
 mod media;
 pub mod payload;
 mod store;
+mod sync;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,8 +34,9 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-pub use payload::{AttachmentRef, Invite, LinkPreview};
-use payload::{JoinReply, JoinRequest, LogCreds, MirrorCreds, Payload};
+pub use link::{LinkChannel, LinkOffer, LinkRole};
+pub use payload::{AttachmentRef, DeviceRecord, Invite, LinkPreview};
+use payload::{JoinReply, JoinRequest, LogCreds, MirrorCreds, Payload, SyncOp};
 use store::{ChatRow, MemberRow, MessageRow, MirrorRow, QueueRow, Store};
 pub use store::{ChatState, MessageStatus};
 
@@ -89,6 +92,8 @@ pub trait Listener: Send + Sync {
     fn changed(&self, chat_id: Option<String>);
     /// Участник `member_id` печатает или что-то отправляет (`kind`: text, voice, photo, file).
     fn typing(&self, _chat_id: String, _member_id: String, _kind: String) {}
+    /// Другое устройство аккаунта изменило настройку приложения `key` (папки и т. п.) или список устройств (`devices`).
+    fn synced(&self, _key: String) {}
 }
 
 // ───────────────────────────── Публичные модели ─────────────────────────────
@@ -123,6 +128,20 @@ pub struct Chat {
     pub backup_node: Option<String>,
     /// В архиве: скрыт из основного списка. Новое сообщение возвращает чат, если он не заглушён.
     pub archived: bool,
+    /// MLS group id (hex) — одинаковый на всех устройствах аккаунта, в отличие от локального `id`.
+    pub gid: Option<String>,
+}
+
+/// Устройство аккаунта (для списка устройств и карты сети).
+#[derive(Clone, Debug)]
+pub struct Device {
+    pub id: String,
+    pub name: String,
+    pub platform: String,
+    pub node: String,
+    pub is_this: bool,
+    /// Когда устройство последний раз о себе сообщало (мс).
+    pub seen_ms: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +276,11 @@ pub struct StorageUsage {
 const MEDIA_SETTINGS_KEY: &str = "media_settings";
 const SAVED_CHAT_KEY: &str = "saved_chat";
 const SAVED_TITLE: &str = "Избранное";
+/// Снимок аккаунта от другого устройства ещё не разобран (вступаем в чаты).
+const LINK_PENDING_KEY: &str = "link.pending";
+const DEVICE_ID_KEY: &str = "device.id";
+/// Сколько последних сообщений каждого чата уходит новому устройству.
+const LINK_HISTORY: u32 = 1000;
 
 // ───────────────────────────── Клиент ─────────────────────────────
 
@@ -361,21 +385,27 @@ impl Client {
         let provider = OpenMlsRustCrypto::default();
         *provider.storage().values.write().unwrap() = store.load_mls()?;
 
-        let stored = store.get("account.id")?.zip(store.get("account.signer")?);
-        let (me, signer) = match stored {
-            Some((id, signer)) => {
-                let signer: SignatureKeyPair = serde_json::from_slice(&signer).map_err(mls)?;
-                (String::from_utf8(id).unwrap(), signer)
-            }
+        // id аккаунта общий для всех устройств (на новом его кладёт связывание), подпись MLS — своя у каждого.
+        let me = match store.get("account.id")? {
+            Some(id) => String::from_utf8(id).unwrap(),
             None => {
                 let id = hex::encode(random_bytes::<16>());
-                let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).map_err(mls)?;
                 store.set("account.id", id.as_bytes())?;
-                store.set("account.signer", &serde_json::to_vec(&signer).map_err(mls)?)?;
                 info!("🆔 new account {id}");
-                (id, signer)
+                id
             }
         };
+        let signer: SignatureKeyPair = match store.get("account.signer")? {
+            Some(signer) => serde_json::from_slice(&signer).map_err(mls)?,
+            None => {
+                let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).map_err(mls)?;
+                store.set("account.signer", &serde_json::to_vec(&signer).map_err(mls)?)?;
+                signer
+            }
+        };
+        if store.get(DEVICE_ID_KEY)?.is_none() {
+            store.set(DEVICE_ID_KEY, hex::encode(random_bytes::<8>()).as_bytes())?;
+        }
         signer.store(provider.storage()).map_err(mls)?;
         let credential = CredentialWithKey {
             credential: BasicCredential::new(me.as_bytes().to_vec()).into(),
@@ -403,7 +433,12 @@ impl Client {
         });
         tokio::spawn(event_worker(Arc::downgrade(&inner), rx));
         tokio::spawn(reconnect_loop(Arc::downgrade(&inner)));
-        Ok(Self { inner })
+        let client = Self { inner };
+        if client.inner.store.get(LINK_PENDING_KEY)?.is_some() {
+            let c = client.clone();
+            tokio::spawn(async move { c.finish_link().await });
+        }
+        Ok(client)
     }
 
     pub fn set_listener(&self, listener: Arc<dyn Listener>) {
@@ -470,6 +505,7 @@ impl Client {
         let chat = self.create_group(title).await?;
         let link = self.invite_link(&chat.id).await?;
         self.inner.notify(None);
+        self.inner.announce_chat(&chat.id);
         Ok((chat.id, link))
     }
 
@@ -481,6 +517,10 @@ impl Client {
             if self.inner.store.chat(&id)?.is_some() {
                 return Ok(id);
             }
+        }
+        // Новое устройство ещё вступает в «Избранное» аккаунта — своё заводить нельзя.
+        if self.inner.store.get(LINK_PENDING_KEY)?.is_some() {
+            return Err(Error::NotReady);
         }
         let chat = self.create_group(Some(SAVED_TITLE)).await?;
         self.inner.store.set(SAVED_CHAT_KEY, chat.id.as_bytes())?;
@@ -540,75 +580,15 @@ impl Client {
 
     /// Ссылка-приглашение в чат (создаёт очередь при первом вызове). Многоразовая.
     pub async fn invite_link(&self, chat_id: &str) -> Result<String> {
-        let chat = self.inner.store.chat(chat_id)?.ok_or(Error::NoChat)?;
-        if chat.state != ChatState::Active {
-            return Err(Error::NotReady);
-        }
         if self.inner.saved_id().as_deref() == Some(chat_id) {
             return Err(Error::Other("saved messages can't be shared".into()));
         }
-        let q = match self.inner.store.queue_for_chat("invites", chat_id)? {
-            Some(q) => q,
-            None => {
-                let conn = self.inner.conn(&chat.node).await?;
-                let q = new_queue(&conn, chat_id, &chat.node).await?;
-                self.inner.store.insert_queue("invites", &q)?;
-                subscribe_queue(&conn, &q).await?;
-                q
-            }
-        };
-        let hint = self.profile()?.name;
-        let node = chat.node.clone();
-        let model = self.inner.chat_model(chat)?;
-        let title = if model.is_group { model.title } else { String::new() };
-        Ok(Invite { v: 1, node, queue: q.sender_id, hint, title }.encode())
+        self.inner.invite_link(chat_id).await
     }
 
     /// Вступить по ссылке. Чат появляется сразу в состоянии `Joining`, Welcome приходит асинхронно.
     pub async fn accept_invite(&self, link: &str) -> Result<String> {
-        let invite = Invite::decode(link).ok_or(Error::BadInvite)?;
-        let conn = self.inner.conn(&invite.node).await?;
-        let chat_id = new_id();
-        let reply = new_queue(&conn, &chat_id, &invite.node).await?;
-
-        let engine = self.inner.engine.lock().await;
-        let bundle = KeyPackage::builder()
-            .build(CIPHERSUITE, &engine.provider, &engine.signer, engine.credential.clone())
-            .map_err(mls)?;
-        let key_package = bundle.key_package().tls_serialize_detached().map_err(mls)?;
-        engine.save(&self.inner.store)?;
-        drop(engine);
-
-        let title = [&invite.title, &invite.hint]
-            .into_iter()
-            .find(|t| !t.is_empty())
-            .cloned()
-            .unwrap_or_else(|| "Подключение…".to_string());
-        self.inner.store.insert_chat(&ChatRow {
-            id: chat_id.clone(),
-            group_id: None,
-            title,
-            custom_title: false,
-            node: invite.node.clone(),
-            log_id: vec![],
-            write_sk: vec![],
-            read_sk: vec![],
-            read_offset: 0,
-            state: ChatState::Joining,
-            created_ms: now_ms(),
-            last_ms: now_ms(),
-            unread: 0,
-            muted: false,
-            pinned: false,
-        })?;
-        self.inner.store.insert_queue("joins", &reply)?;
-        subscribe_queue(&conn, &reply).await?;
-
-        let body = serde_json::to_vec(&JoinRequest { key_package, reply: reply.sender_id.clone() }).unwrap();
-        expect_done(conn.request(request::Body::QueueSend(QueueSend { sender_id: invite.queue, body }), None).await?)?;
-        info!("🤝 join request sent for chat {chat_id}");
-        self.inner.notify(None);
-        Ok(chat_id)
+        self.inner.accept_invite(link, None).await
     }
 
     pub fn chats(&self) -> Result<Vec<Chat>> {
@@ -664,6 +644,7 @@ impl Client {
     pub fn set_muted(&self, chat_id: &str, muted: bool) -> Result<()> {
         self.inner.store.set_flag(chat_id, "muted", muted)?;
         self.inner.notify(Some(chat_id.into()));
+        self.inner.sync_flags(chat_id);
         Ok(())
     }
 
@@ -685,12 +666,14 @@ impl Client {
             self.inner.store.delete(&archive_key(chat_id))?;
         }
         self.inner.notify(None);
+        self.inner.sync_flags(chat_id);
         Ok(())
     }
 
     pub fn set_pinned(&self, chat_id: &str, pinned: bool) -> Result<()> {
         self.inner.store.set_flag(chat_id, "pinned", pinned)?;
         self.inner.notify(None);
+        self.inner.sync_flags(chat_id);
         Ok(())
     }
 
@@ -700,6 +683,7 @@ impl Client {
         if had > 0 {
             if let Some(chat) = self.inner.store.chat(chat_id)?.filter(|c| c.state == ChatState::Active) {
                 let up_to = self.inner.store.max_incoming_ts(chat_id)?;
+                // Отчёт о прочтении уходит и своим устройствам (они в той же группе) — у них счётчик тоже сбросится.
                 self.inner.send_payload(&chat, &Payload::Read { up_to }).await?;
             }
             self.inner.notify(None);
@@ -710,24 +694,26 @@ impl Client {
     pub fn mark_unread(&self, chat_id: &str) -> Result<()> {
         self.inner.store.touch_chat(chat_id, 0, 1)?;
         self.inner.notify(None);
+        if let Some(gid) = self.inner.gid(chat_id) {
+            self.inner.sync(SyncOp::MarkUnread { gid });
+        }
         Ok(())
     }
 
     /// Удалить чат на этом устройстве (участники продолжат переписку без нас).
     pub fn delete_chat(&self, chat_id: &str) -> Result<()> {
-        for m in self.inner.store.messages(chat_id, u32::MAX, None)? {
-            if let Some(p) = m.file_path {
-                let _ = std::fs::remove_file(p);
-            }
+        if let Some(gid) = self.inner.gid(chat_id) {
+            self.inner.sync(SyncOp::DeleteChat { gid });
         }
-        self.inner.store.delete_chat(chat_id)?;
-        self.inner.notify(None);
-        Ok(())
+        self.inner.delete_chat(chat_id)
     }
 
     pub fn clear_history(&self, chat_id: &str) -> Result<()> {
         self.inner.store.clear_history(chat_id)?;
         self.inner.notify(Some(chat_id.into()));
+        if let Some(gid) = self.inner.gid(chat_id) {
+            self.inner.sync(SyncOp::ClearHistory { gid });
+        }
         Ok(())
     }
 
@@ -808,11 +794,10 @@ impl Client {
 
     pub fn delete_message_locally(&self, message_id: &str) -> Result<()> {
         if let Some(m) = self.inner.store.message(message_id)? {
-            if let Some(p) = m.file_path {
-                let _ = std::fs::remove_file(p);
+            if let Some(gid) = self.inner.gid(&m.chat_id) {
+                self.inner.sync(SyncOp::DeleteLocal { gid, id: m.id.clone() });
             }
-            self.inner.store.delete_message(message_id)?;
-            self.inner.notify(Some(m.chat_id));
+            self.inner.delete_message_locally(&m);
         }
         Ok(())
     }
@@ -849,9 +834,59 @@ impl Client {
 
     /// Сохранить настройки и сразу применить новый лимит кэша.
     pub fn set_media_settings(&self, settings: &MediaSettings) -> Result<()> {
-        self.inner.store.set(MEDIA_SETTINGS_KEY, &serde_json::to_vec(settings).unwrap())?;
+        let json = serde_json::to_string(settings).unwrap();
+        self.inner.store.set(MEDIA_SETTINGS_KEY, json.as_bytes())?;
         self.inner.enforce_cache_limit(None)?;
+        self.inner.sync(SyncOp::Media { json });
         Ok(())
+    }
+
+    // ── несколько устройств ──
+
+    /// Настройка приложения, общая для всех устройств аккаунта (`value` — JSON; чаты в нём — по `gid`).
+    pub fn set_app_setting(&self, key: &str, value: &str) -> Result<()> {
+        let ts = now_ms();
+        self.inner.store_app_setting(key, value, ts)?;
+        self.inner.sync(SyncOp::App { key: key.into(), value: value.into(), ts });
+        Ok(())
+    }
+
+    pub fn app_setting(&self, key: &str) -> Result<Option<String>> {
+        Ok(self.inner.app_setting(key)?.map(|(v, _)| v))
+    }
+
+    /// Это устройство: имя, платформа и нода подключения. Рассылается остальным устройствам (для карты и списка).
+    pub fn set_device(&self, name: &str, platform: &str, node: &str) -> Result<()> {
+        let this = self.inner.this_device()?;
+        let changed = this.name != name || this.platform != platform || this.node != node;
+        let record = DeviceRecord {
+            id: this.id,
+            name: name.into(),
+            platform: platform.into(),
+            node: node.into(),
+            sig: this.sig,
+            ts: now_ms(),
+        };
+        self.inner.store.set(&device_key(&record.id), &serde_json::to_vec(&record).unwrap())?;
+        if changed {
+            self.inner.sync(SyncOp::Device(record));
+        }
+        Ok(())
+    }
+
+    /// Все устройства аккаунта, это — первым.
+    pub fn devices(&self) -> Result<Vec<Device>> {
+        self.inner.devices()
+    }
+
+    /// Отключить другое устройство: оно удаляется из всех чатов и само стирает аккаунт.
+    pub async fn remove_device(&self, device_id: &str) -> Result<()> {
+        self.inner.remove_device(device_id).await
+    }
+
+    /// Старое устройство: отправить аккаунт новому по открытому каналу (пользователь уже подтвердил).
+    pub async fn link_send_account(&self, ch: &LinkChannel) -> Result<()> {
+        self.link_send(ch).await
     }
 
     pub fn storage_usage(&self) -> Result<StorageUsage> {
@@ -975,7 +1010,9 @@ impl Inner {
         let is_owner = self.store.get(&owner_key(&row.id))?.is_some();
         let backup_node = self.store.mirror(&row.id)?.map(|m| m.node);
         let archived = self.store.get(&archive_key(&row.id))?.is_some();
+        let gid = row.group_id.as_deref().map(hex::encode);
         Ok(Chat {
+            gid,
             last_message: self.store.last_message(&row.id)?.map(|m| self.message_model(m, &names)),
             id: row.id,
             title,
@@ -1006,14 +1043,18 @@ impl Inner {
         for _attempt in 0..3 {
             let chat = self.store.chat(chat_id)?.ok_or(Error::NoChat)?;
             let mut group = engine.group(&chat)?;
-            let Some(index) =
-                group.members().find(|m| m.credential.serialized_content() == member_id.as_bytes()).map(|m| m.index)
-            else {
+            // У аккаунта может быть несколько устройств — удаляем все его листья.
+            let indices: Vec<LeafNodeIndex> = group
+                .members()
+                .filter(|m| m.credential.serialized_content() == member_id.as_bytes())
+                .map(|m| m.index)
+                .collect();
+            if indices.is_empty() {
                 // Уже удалён (например, кто-то успел раньше).
                 self.store.delete_member(chat_id, member_id)?;
                 return Ok(());
-            };
-            let (commit, _, _) = group.remove_members(&engine.provider, &engine.signer, &[index]).map_err(mls)?;
+            }
+            let (commit, _, _) = group.remove_members(&engine.provider, &engine.signer, &indices).map_err(mls)?;
             let conn = self.conn(&chat.node).await?;
             let body = request::Body::LogCommit(LogCommit {
                 log_id: chat.log_id.clone(),
@@ -1499,6 +1540,15 @@ impl Inner {
         info!("✅ joined chat {}", chat.id);
         let _ = self.send_payload(&chat, &self.profile_payload()?).await;
         self.notify(None);
+        // Вступили сами (не по команде своего устройства) — пусть остальные устройства тоже вступят.
+        if self.store.get(&quiet_key(&chat.id))?.is_none() {
+            self.announce_chat(&chat.id);
+        } else {
+            self.store.delete(&quiet_key(&chat.id))?;
+        }
+        if self.saved_id().as_deref() == Some(chat.id.as_str()) {
+            self.announce_device();
+        }
         Ok(())
     }
 
@@ -1596,24 +1646,36 @@ impl Inner {
     ) -> Result<()> {
         match payload {
             Payload::Message { id, ts, text, att, reply_to, link, fwd, fwd_id } => {
+                // С другого своего устройства — это наше исходящее.
+                let mine = sender == self.me;
                 let settings = self.media_settings();
                 let auto = att.as_ref().is_some_and(|a| settings.auto_download(a));
                 let inserted = self.store.insert_message(&MessageRow {
                     id: id.clone(),
                     chat_id: chat.id.clone(),
                     sender_id: sender.into(),
-                    outgoing: false,
+                    outgoing: mine,
                     ts,
                     text,
                     attachment: att.map(|a| *a),
-                    status: MessageStatus::Received,
+                    status: if mine { MessageStatus::Sent } else { MessageStatus::Received },
                     file_path: None,
                     reply_to,
                     link: link.and_then(|l| l.sanitized()),
                     fwd: fwd.map(|f| f.chars().take(64).collect()),
                     fwd_id: fwd_id.filter(|k| Forward::valid_id(k)),
                 })?;
-                if inserted {
+                if inserted && mine {
+                    self.store.touch_chat(&chat.id, ts, 0)?;
+                    if auto {
+                        let inner = self.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = inner.download(&id).await {
+                                warn!("⚠️ auto-download failed: {e}");
+                            }
+                        });
+                    }
+                } else if inserted {
                     self.store.touch_chat(&chat.id, ts.max(now_ms().min(ts + 60_000)), 1)?;
                     self.schedule_delivery_receipt(&chat.id);
                     // Как в Telegram: новое сообщение достаёт чат из архива, если он не заглушён.
@@ -1630,11 +1692,25 @@ impl Inner {
                     }
                 }
             }
+            Payload::Profile { name, avatar } if sender == self.me => {
+                // Профиль поменяли на другом устройстве.
+                self.store.set("profile.name", name.as_bytes())?;
+                match &avatar {
+                    Some(a) => self.store.set("profile.avatar", a)?,
+                    None => self.store.delete("profile.avatar")?,
+                }
+                self.notify(None);
+            }
             Payload::Profile { name, avatar } => {
                 self.store.upsert_member(&chat.id, sender, &name, avatar.as_deref())?;
             }
             Payload::Title { title } => {
                 self.store.set_title(&chat.id, &title, !title.is_empty())?;
+            }
+            Payload::Read { up_to } if sender == self.me => {
+                // Прочитано на другом своём устройстве.
+                self.store.set_read_up_to(&chat.id, up_to)?;
+                self.notify(None);
             }
             Payload::Read { up_to } => {
                 self.store.mark_outgoing_read(&chat.id, up_to)?;
@@ -1647,8 +1723,19 @@ impl Inner {
                     }
                 }
             }
+            Payload::Delivered { .. } if sender == self.me => {}
             Payload::Delivered { up_to } => {
                 self.store.mark_outgoing_delivered(&chat.id, up_to)?;
+            }
+            Payload::SyncChat { link, gid } => {
+                if sender == self.me && self.saved_id().as_deref() == Some(chat.id.as_str()) {
+                    self.join_synced_chat(link, gid);
+                }
+            }
+            Payload::Sync(op) => {
+                if sender == self.me && self.saved_id().as_deref() == Some(chat.id.as_str()) {
+                    self.apply_sync(op)?;
+                }
             }
             Payload::Mirror(creds) => {
                 if node_key(&creds.node) != node_key(&chat.node) {
@@ -1787,6 +1874,15 @@ const TYPING_FRESH_MS: u64 = 10_000;
 
 fn archive_key(chat_id: &str) -> String {
     format!("archived:{chat_id}")
+}
+
+/// Чат, в который вступили по команде своего устройства: о нём уже знают, объявлять не нужно.
+fn quiet_key(chat_id: &str) -> String {
+    format!("quiet.{chat_id}")
+}
+
+fn device_key(id: &str) -> String {
+    format!("device.rec.{id}")
 }
 
 fn owner_key(chat_id: &str) -> String {

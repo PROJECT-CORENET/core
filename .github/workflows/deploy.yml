@@ -51,10 +51,10 @@ jobs:
       fail-fast: false
       matrix:
         include: &nodes
-          - { runner: proxy,   name: N1, region: RU, host: "188.225.72.79:7445" }
-          - { runner: nl,      name: N2, region: NL, host: "141.98.235.172:7445" }
-          - { runner: vn,      name: N3, region: RU, host: "213.171.4.253:7445" }
-          - { runner: imirjar, name: I1, region: RU, host: "91.215.121.220:7445" }
+          - { runner: proxy, name: N1, region: RU, host: "188.225.72.79:7445" }
+          - { runner: nl, name: N2, region: NL, host: "141.98.235.172:7445" }
+          - { runner: vn, name: N3, region: RU, host: "213.171.4.253:7445" }
+    #        - { runner: imirjar, name: I1, region: RU, host: "91.215.121.220:7445" }
     runs-on: [self-hosted, "${{ matrix.runner }}"]
     name: identity ${{ matrix.name }}
     steps:

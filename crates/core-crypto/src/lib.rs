@@ -76,6 +76,13 @@ impl NoiseKeypair {
     }
 }
 
+impl NoiseKeypair {
+    /// Общий секрет X25519 с ключом `peer` (для одноразовых каналов вне Noise, например связывания устройств).
+    pub fn shared_secret(&self, peer: &[u8; 32]) -> [u8; 32] {
+        x25519_dalek::StaticSecret::from(self.private).diffie_hellman(&x25519_dalek::PublicKey::from(*peer)).to_bytes()
+    }
+}
+
 impl std::fmt::Debug for NoiseKeypair {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "NoiseKeypair(pk={})", hex_prefix(&self.public))
@@ -89,6 +96,13 @@ fn hex_prefix(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_secret_matches() {
+        let (a, b) = (NoiseKeypair::generate(), NoiseKeypair::generate());
+        assert_eq!(a.shared_secret(&b.public), b.shared_secret(&a.public));
+        assert_ne!(a.shared_secret(&b.public), NoiseKeypair::generate().shared_secret(&b.public));
+    }
 
     #[test]
     fn sign_and_verify() {

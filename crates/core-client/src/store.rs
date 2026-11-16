@@ -41,7 +41,7 @@ pub enum MessageStatus {
 }
 
 impl MessageStatus {
-    fn from_i64(v: i64) -> Self {
+    pub(crate) fn from_i64(v: i64) -> Self {
         match v {
             0 => Self::Sending,
             2 => Self::Read,
@@ -283,6 +283,15 @@ impl Store {
         self.with(|c| c.query_row("SELECT v FROM kv WHERE k = ?", [k], |r| r.get(0)).optional())
     }
 
+    /// Все ключи с префиксом (для настроек приложения и реестра устройств).
+    pub fn get_prefix(&self, prefix: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        self.with(|c| {
+            let mut stmt = c.prepare("SELECT k, v FROM kv WHERE substr(k, 1, length(?1)) = ?1")?;
+            let rows = stmt.query_map([prefix], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect()
+        })
+    }
+
     pub fn set(&self, k: &str, v: &[u8]) -> Result<()> {
         self.with(|c| c.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", params![k, v]).map(drop))
     }
@@ -362,6 +371,13 @@ impl Store {
         })
     }
 
+    /// Чат по MLS group id — один и тот же на всех устройствах аккаунта (локальные id разные).
+    pub fn chat_by_group(&self, group_id: &[u8]) -> Result<Option<ChatRow>> {
+        self.with(|c| {
+            c.query_row(&format!("SELECT {CHAT_COLS} FROM chats WHERE group_id = ?"), [group_id], chat_row).optional()
+        })
+    }
+
     pub fn activate_chat(
         &self,
         id: &str,
@@ -419,6 +435,23 @@ impl Store {
             c.execute("UPDATE chats SET unread = 0 WHERE id = ?", [id])?;
             Ok(n)
         })
+    }
+
+    /// Прочитано на другом устройстве до `up_to`: непрочитанными остаются только входящие новее.
+    pub fn set_read_up_to(&self, id: &str, up_to: u64) -> Result<u32> {
+        self.with(|c| {
+            let left: u32 = c.query_row(
+                "SELECT COUNT(*) FROM messages WHERE chat_id = ? AND outgoing = 0 AND ts > ?",
+                params![id, up_to as i64],
+                |r| r.get(0),
+            )?;
+            c.execute("UPDATE chats SET unread = MIN(unread, ?) WHERE id = ?", params![left, id])?;
+            Ok(left)
+        })
+    }
+
+    pub fn set_unread(&self, id: &str, unread: u32) -> Result<()> {
+        self.with(|c| c.execute("UPDATE chats SET unread = ? WHERE id = ?", params![unread, id]).map(drop))
     }
 
     pub fn delete_chat(&self, id: &str) -> Result<()> {

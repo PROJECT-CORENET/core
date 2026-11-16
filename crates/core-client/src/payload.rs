@@ -62,6 +62,52 @@ pub enum Payload {
     Mirror(MirrorCreds),
     /// Участник выходит из группы: кто-то из оставшихся удаляет его коммитом.
     Leave,
+    /// Только в «Избранном», между своими устройствами: появился чат (создан или принято приглашение) —
+    /// остальные устройства вступают по ссылке. `gid` — MLS group id (hex), чтобы не вступать дважды.
+    SyncChat {
+        link: String,
+        gid: String,
+    },
+    /// Только в «Избранном», между своими устройствами: изменение состояния аккаунта.
+    Sync(SyncOp),
+}
+
+/// Что синхронизируется между устройствами одного аккаунта. Чаты — по MLS group id (hex):
+/// локальные id чатов на устройствах разные.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum SyncOp {
+    /// Закреп, звук, архив.
+    ChatFlags { gid: String, pinned: bool, muted: bool, archived: bool },
+    /// Прочитано до `up_to` (ts входящих).
+    ReadUpTo { gid: String, up_to: u64 },
+    MarkUnread { gid: String },
+    /// Чат удалён с устройства (без выхода из группы).
+    DeleteChat { gid: String },
+    ClearHistory { gid: String },
+    /// Сообщение удалено «у себя».
+    DeleteLocal { gid: String, id: String },
+    /// Настройки автозагрузки и кэша.
+    Media { json: String },
+    /// Настройка приложения (папки, оформление…): ключ и значение-JSON, последнее по времени побеждает.
+    App { key: String, value: String, ts: u64 },
+    /// Устройство аккаунта: имя, платформа, нода подключения и ключ подписи MLS (по нему отключают).
+    Device(DeviceRecord),
+    /// Отключить устройство: все удаляют его из своих групп, само устройство стирает аккаунт.
+    RemoveDevice { id: String },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct DeviceRecord {
+    pub id: String,
+    pub name: String,
+    /// ios | macos | …
+    pub platform: String,
+    /// Нода, к которой устройство подключено (для карты сети).
+    pub node: String,
+    /// Открытый ключ подписи MLS этого устройства (hex).
+    pub sig: String,
+    pub ts: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -205,43 +251,43 @@ impl Invite {
     }
 }
 
-mod hex_bytes {
+pub(crate) mod hex_bytes {
     use serde::{Deserialize, Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&hex::encode(v))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         hex::decode(String::deserialize(d)?).map_err(serde::de::Error::custom)
     }
 }
 
-mod b64 {
+pub(crate) mod b64 {
     use super::*;
     use serde::{Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&STANDARD.encode(v))
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
         STANDARD.decode(String::deserialize(d)?).map_err(serde::de::Error::custom)
     }
 }
 
-mod b64_opt {
+pub(crate) mod b64_opt {
     use super::*;
     use serde::{Deserializer, Serializer};
 
-    pub fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
+    pub(crate) fn serialize<S: Serializer>(v: &Option<Vec<u8>>, s: S) -> Result<S::Ok, S::Error> {
         match v {
             Some(v) => s.serialize_str(&STANDARD.encode(v)),
             None => s.serialize_none(),
         }
     }
 
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<u8>>, D::Error> {
         Option::<String>::deserialize(d)?.map(|s| STANDARD.decode(s).map_err(serde::de::Error::custom)).transpose()
     }
 }
