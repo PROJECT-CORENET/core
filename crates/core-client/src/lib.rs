@@ -8,6 +8,7 @@
 //!    отвечает Welcome + ключами журнала, зашифрованными экспортёром MLS новой эпохи.
 //! 4. Сообщения — MLS application messages в журнале; нода видит только шифротекст.
 
+mod calls;
 mod link;
 mod media;
 pub mod payload;
@@ -34,6 +35,7 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+pub use calls::{media as call_media, Call, CallPeer, MAX_VIDEO_FRAME, RING_TIMEOUT_MS};
 pub use link::{LinkChannel, LinkOffer, LinkRole};
 pub use payload::{AttachmentRef, DeviceRecord, Invite, LinkPreview};
 use payload::{JoinReply, JoinRequest, LogCreds, MirrorCreds, Payload, SyncOp};
@@ -45,6 +47,8 @@ const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA2
 const CREDS_LABEL: &str = "CORE/v1/log-creds";
 /// Прикладное сообщение должно поместиться в блоб журнала вместе с обёрткой MLS.
 const MAX_PAYLOAD: usize = 12 * 1024;
+/// Общая настройка аккаунта со списком заблокированных (id собеседников).
+pub const BLOCKED_KEY: &str = "blocked";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const RECONNECT_EVERY: Duration = Duration::from_secs(3);
 /// Нода чата недоступна дольше этого — переезжаем на резервный журнал.
@@ -95,6 +99,10 @@ pub trait Listener: Send + Sync {
     fn typing(&self, _chat_id: String, _member_id: String, _kind: String) {}
     /// Другое устройство аккаунта изменило настройку приложения `key` (папки и т. п.) или список устройств (`devices`).
     fn synced(&self, _key: String) {}
+    /// Звонок изменился: вызов, ответ, конец, кто-то вошёл/вышел, выключил микрофон или камеру.
+    fn call_changed(&self, _call_id: String) {}
+    /// Кадр звонка от участника `peer` (`kind` — `call_media::*`). Вызывается часто и не на главном потоке.
+    fn call_media(&self, _call_id: String, _peer: String, _kind: u8, _data: Vec<u8>) {}
 }
 
 // ───────────────────────────── Публичные модели ─────────────────────────────
@@ -301,6 +309,8 @@ struct Inner {
     listener: RwLock<Option<Arc<dyn Listener>>>,
     default_node: RwLock<String>,
     downloading: Mutex<std::collections::HashSet<String>>,
+    /// Сообщения, которые сейчас отправляются (повтор не запускается второй раз).
+    sending: Mutex<std::collections::HashSet<String>>,
     /// Чтобы «Избранное» не создалось дважды при одновременных вызовах.
     saved_lock: tokio::sync::Mutex<()>,
     /// Ноды, где можно заводить резервные журналы (обычно — основная сеть пользователя).
@@ -311,6 +321,9 @@ struct Inner {
     failover_after: RwLock<Duration>,
     /// Чаты, по которым скоро уйдёт отчёт о доставке (один на пачку сообщений).
     delivery_pending: Mutex<std::collections::HashSet<String>>,
+    /// Рантайм, в котором открыт клиент: синхронные вызовы из приложения (не из tokio) запускают фон через него.
+    rt: tokio::runtime::Handle,
+    calls: calls::Calls,
 }
 
 /// Всё, что меняет состояние MLS, — строго по очереди под этим замком.
@@ -382,6 +395,10 @@ impl Client {
             return Err(Error::Other("database key must be 32 bytes".into()));
         }
         let store = Store::open(&dir.join("client.db"), db_key)?;
+        let moved = store.rebase_media(&dir.join("media"))?;
+        if moved > 0 {
+            info!("📁 media paths moved to the current data dir: {moved}");
+        }
 
         let provider = OpenMlsRustCrypto::default();
         *provider.storage().values.write().unwrap() = store.load_mls()?;
@@ -426,16 +443,32 @@ impl Client {
             listener: RwLock::new(None),
             default_node: RwLock::new(default_node.to_string()),
             downloading: Mutex::default(),
+            sending: Mutex::default(),
             saved_lock: tokio::sync::Mutex::default(),
             backup_nodes: RwLock::default(),
             mirror_lock: tokio::sync::Mutex::default(),
             delivery_pending: Mutex::default(),
+            rt: tokio::runtime::Handle::current(),
             down_since: Mutex::default(),
             failover_after: RwLock::new(FAILOVER_AFTER),
+            calls: calls::Calls::default(),
         });
         tokio::spawn(event_worker(Arc::downgrade(&inner), rx));
         tokio::spawn(reconnect_loop(Arc::downgrade(&inner)));
         let client = Self { inner };
+        {
+            // Догрузка пропущенного: пока приложение было закрыто, загрузка прервалась или файл
+            // пришёл с другого своего устройства. Чуть позже — чтобы успело подняться соединение.
+            // Слабая ссылка: закрытый за это время клиент не держит базу открытой.
+            let weak = Arc::downgrade(&client.inner);
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                if let Some(inner) = weak.upgrade() {
+                    inner.retry_unsent().await;
+                    inner.resume_downloads().await;
+                }
+            });
+        }
         if client.inner.store.get(LINK_PENDING_KEY)?.is_some() {
             let c = client.clone();
             tokio::spawn(async move { c.finish_link().await });
@@ -787,6 +820,16 @@ impl Client {
         self.inner
             .send_message(chat_id, caption.trim().to_string(), Some((draft, local)), None, Some(id), None, fwd)
             .await
+    }
+
+    /// Повторить отправку сообщения с ошибкой (как в Telegram — нажатием на «!»).
+    pub async fn retry_message(&self, message_id: &str) -> Result<()> {
+        self.inner.retry(message_id).await
+    }
+
+    /// Доля переданного вложения сообщения (выгрузка или загрузка) или `None`, если передачи нет.
+    pub fn transfer_progress(&self, message_id: &str) -> Option<f32> {
+        media::progress(message_id)
     }
 
     /// Скачать вложение (маленькие скачиваются сами). Возвращает путь к файлу.
@@ -1182,7 +1225,7 @@ impl Inner {
 
         // Насос событий: только пересылает в общий обработчик, чтобы не блокировать чтение ответов.
         let (tx, weak, node_s, me) = (self.events.clone(), Arc::downgrade(self), node.to_string(), client.clone());
-        tokio::spawn(async move {
+        self.rt.spawn(async move {
             while let Some(ev) = events.recv().await {
                 if tx.send((node_s.clone(), ev)).is_err() {
                     return;
@@ -1267,55 +1310,101 @@ impl Inner {
             Some((a, p)) => (Some(a), Some(p.to_string_lossy().into_owned())),
             None => (None, None),
         };
-        self.store.insert_message(&MessageRow {
+        let row = MessageRow {
             id: id.clone(),
             chat_id: chat_id.into(),
             sender_id: self.me.clone(),
             outgoing: true,
             ts,
-            text: text.clone(),
-            attachment: att.clone(),
+            text,
+            attachment: att,
             status: MessageStatus::Sending,
-            file_path: local.clone(),
-            reply_to: reply_to.clone(),
-            link: link.clone(),
+            file_path: local,
+            reply_to,
+            link,
             fwd: fwd.as_ref().map(|f| f.name.clone()),
-            fwd_id: fwd.as_ref().and_then(|f| f.id.clone()),
-        })?;
+            fwd_id: fwd.and_then(|f| f.id),
+        };
+        self.store.insert_message(&row)?;
         self.store.touch_chat(chat_id, ts, 0)?;
         self.notify(Some(chat_id.into()));
+        self.deliver(&chat, row).await.map(|_| id)
+    }
 
+    /// Выгрузить вложение (если ещё не выгружено) и отправить сообщение в чат; статус — «отправлено» или «ошибка».
+    /// Повтор безопасен: получатели отбрасывают дубликаты по id.
+    async fn deliver(self: &Arc<Self>, chat: &ChatRow, row: MessageRow) -> Result<()> {
+        let id = row.id.clone();
+        if !self.sending.lock().unwrap().insert(id.clone()) {
+            return Err(Error::Other("already sending".into()));
+        }
+        let local = row.file_path.clone();
         let result = async {
-            let att = match (att, &local) {
-                (Some(mut a), Some(path)) => {
+            let att = match row.attachment {
+                Some(mut a) if a.key.is_empty() => {
+                    let path = local.as_deref().ok_or(Error::Other("attachment file is gone".into()))?;
                     let conn = self.conn(&chat.node).await?;
-                    media::upload(&conn, &chat.node, Path::new(path), &mut a).await?;
+                    media::upload(&conn, &chat.node, Path::new(path), &mut a, Some(&id)).await?;
                     self.store.set_attachment(&id, &a)?;
                     Some(a)
                 }
-                _ => None,
+                other => other,
             };
             let payload = Payload::Message {
                 id: id.clone(),
-                ts,
-                text,
+                ts: row.ts,
+                text: row.text,
                 att: att.map(Box::new),
-                reply_to,
-                link: link.map(Box::new),
-                fwd_id: fwd.as_ref().and_then(|f| f.id.clone()),
-                fwd: fwd.map(|f| f.name),
+                reply_to: row.reply_to,
+                link: row.link.map(Box::new),
+                fwd_id: row.fwd_id,
+                fwd: row.fwd,
             };
-            self.send_payload(&chat, &payload).await
+            self.send_payload(chat, &payload).await
         }
         .await;
+        self.sending.lock().unwrap().remove(&id);
 
         let status = if result.is_ok() { MessageStatus::Sent } else { MessageStatus::Failed };
         self.store.set_status(&id, status)?;
-        if local.is_some() {
+        if let Err(e) = &result {
+            warn!("⚠️ message {id} not sent: {e}");
+        } else if local.is_some() {
             self.enforce_cache_limit(local.as_deref())?;
         }
-        self.notify(Some(chat_id.into()));
-        result.map(|_| id)
+        self.notify(Some(chat.id.clone()));
+        result.map(drop)
+    }
+
+    /// Повторить отправку своего неотправленного сообщения.
+    async fn retry(self: &Arc<Self>, message_id: &str) -> Result<()> {
+        let row = self.store.message(message_id)?.ok_or(Error::Other("message not found".into()))?;
+        if !row.outgoing || row.status == MessageStatus::Sent || row.status == MessageStatus::Read {
+            return Ok(());
+        }
+        let chat = self.store.chat(&row.chat_id)?.ok_or(Error::NoChat)?;
+        if chat.state != ChatState::Active {
+            return Err(Error::NotReady);
+        }
+        self.store.set_status(message_id, MessageStatus::Sending)?;
+        self.notify(Some(chat.id.clone()));
+        info!("🔁 retrying message {message_id}");
+        self.deliver(&chat, row).await
+    }
+
+    /// Автоповтор: всё неотправленное (ошибки и «зависшие» после перезапуска) — по порядку.
+    async fn retry_unsent(self: &Arc<Self>) {
+        let Ok(ids) = self.store.unsent_outgoing() else { return };
+        for id in ids {
+            if self.sending.lock().unwrap().contains(&id) {
+                continue;
+            }
+            // Нода недоступна — остальные тоже не уйдут, ждём следующего раза.
+            if let Err(e) = self.retry(&id).await {
+                debug!("retry of {id} failed: {e}");
+                break;
+            }
+        }
     }
 
     fn saved_id(&self) -> Option<String> {
@@ -1367,6 +1456,35 @@ impl Inner {
         Ok(freed)
     }
 
+    /// Собеседник в списке блокировок (общая настройка аккаунта `blocked` — JSON-массив id).
+    fn is_blocked(&self, member_id: &str) -> bool {
+        self.app_setting(BLOCKED_KEY)
+            .ok()
+            .flatten()
+            .and_then(|(v, _)| serde_json::from_str::<Vec<String>>(&v).ok())
+            .is_some_and(|ids| ids.iter().any(|id| id == member_id))
+    }
+
+    /// Скачать по правилам автозагрузки то, чего нет на устройстве (до 40 последних вложений).
+    async fn resume_downloads(self: &Arc<Self>) {
+        let settings = self.media_settings();
+        let Ok(rows) = self.store.missing_media(40) else { return };
+        let todo: Vec<String> = rows
+            .into_iter()
+            .filter(|m| m.attachment.as_ref().is_some_and(|a| settings.auto_download(a)))
+            .map(|m| m.id)
+            .collect();
+        if todo.is_empty() {
+            return;
+        }
+        info!("⏬ resuming {} auto-downloads", todo.len());
+        for id in todo {
+            if let Err(e) = self.download(&id).await {
+                warn!("⚠️ resume download {id}: {e}");
+            }
+        }
+    }
+
     async fn download(self: &Arc<Self>, message_id: &str) -> Result<String> {
         let m = self.store.message(message_id)?.ok_or(Error::Other("message not found".into()))?;
         if let Some(p) = m.file_path.as_ref().filter(|p| Path::new(p).exists()) {
@@ -1380,7 +1498,7 @@ impl Inner {
             let conn = self.conn(&a.node).await?;
             let ext = Path::new(&a.name).extension().and_then(|e| e.to_str()).unwrap_or("bin");
             let path = self.dir.join("media").join(format!("{}.{ext}", m.id));
-            media::download(&conn, &a, &path).await?;
+            media::download(&conn, &a, &path, Some(&m.id)).await?;
             let path = path.to_string_lossy().into_owned();
             self.store.set_file_path(&m.id, Some(&path))?;
             self.enforce_cache_limit(Some(&path))?;
@@ -1603,7 +1721,7 @@ impl Inner {
                 } else if added {
                     // Представиться новичку (он не видит прошлых сообщений) — уже вне замка.
                     let (inner, chat) = (self.clone(), chat.clone());
-                    tokio::spawn(async move {
+                    self.rt.spawn(async move {
                         if let Ok(p) = inner.profile_payload() {
                             let _ = inner.send_payload(&chat, &p).await;
                         }
@@ -1625,7 +1743,7 @@ impl Inner {
             return;
         }
         let (inner, chat_id) = (self.clone(), chat_id.to_string());
-        tokio::spawn(async move {
+        self.rt.spawn(async move {
             tokio::time::sleep(Duration::from_millis(700)).await;
             inner.delivery_pending.lock().unwrap().remove(&chat_id);
             let Ok(Some(chat)) = inner.store.chat(&chat_id) else { return };
@@ -1646,6 +1764,18 @@ impl Inner {
         payload: Payload,
         engine: &Engine,
     ) -> Result<()> {
+        // Заблокированный собеседник: его сообщения, реакции и «печатает…» не принимаются
+        // (служебное — профиль, состав группы — применяется, иначе разойдётся состояние MLS).
+        if sender != self.me
+            && matches!(
+                payload,
+                Payload::Message { .. } | Payload::React { .. } | Payload::Typing { .. } | Payload::Call { .. }
+            )
+            && self.is_blocked(sender)
+        {
+            debug!("🚫 dropped payload from blocked {}", short(sender));
+            return Ok(());
+        }
         match payload {
             Payload::Message { id, ts, text, att, reply_to, link, fwd, fwd_id } => {
                 // С другого своего устройства — это наше исходящее.
@@ -1671,7 +1801,7 @@ impl Inner {
                     self.store.touch_chat(&chat.id, ts, 0)?;
                     if auto {
                         let inner = self.clone();
-                        tokio::spawn(async move {
+                        self.rt.spawn(async move {
                             if let Err(e) = inner.download(&id).await {
                                 warn!("⚠️ auto-download failed: {e}");
                             }
@@ -1686,7 +1816,7 @@ impl Inner {
                     }
                     if auto {
                         let inner = self.clone();
-                        tokio::spawn(async move {
+                        self.rt.spawn(async move {
                             if let Err(e) = inner.download(&id).await {
                                 warn!("⚠️ auto-download failed: {e}");
                             }
@@ -1734,6 +1864,9 @@ impl Inner {
                     self.join_synced_chat(link, gid);
                 }
             }
+            Payload::Call { id, op } => {
+                self.apply_call(chat, sender, id, op)?;
+            }
             Payload::Sync(op) => {
                 if sender == self.me && self.saved_id().as_deref() == Some(chat.id.as_str()) {
                     self.apply_sync(op)?;
@@ -1753,7 +1886,7 @@ impl Inner {
                     .filter(|id| id != sender)
                     .min();
                 if remover.as_deref() == Some(self.me.as_str()) {
-                    tokio::spawn(self.clone().remove_member_task(chat.id.clone(), sender.to_string()));
+                    self.rt.spawn(self.clone().remove_member_task(chat.id.clone(), sender.to_string()));
                 }
             }
             Payload::React { id, emoji } => {
@@ -1796,12 +1929,13 @@ async fn reconnect_loop(inner: std::sync::Weak<Inner>) {
             }
             nodes.sort();
             nodes.dedup();
+            let mut reconnected = false;
             for node in nodes {
                 let connected = inner.conns.lock().unwrap().contains_key(&node);
                 if !connected {
                     match inner.conn(&node).await {
                         Ok(_) => {
-                            inner.down_since.lock().unwrap().remove(&node);
+                            reconnected |= inner.down_since.lock().unwrap().remove(&node).is_some();
                         }
                         Err(e) => {
                             debug!("reconnect to {} failed: {e}", short(&node));
@@ -1811,6 +1945,14 @@ async fn reconnect_loop(inner: std::sync::Weak<Inner>) {
                 } else {
                     inner.down_since.lock().unwrap().remove(&node);
                 }
+            }
+            // Связь вернулась — догружаем то, что не скачалось, пока её не было.
+            if reconnected {
+                let inner = inner.clone();
+                tokio::spawn(async move {
+                    inner.retry_unsent().await;
+                    inner.resume_downloads().await;
+                });
             }
             // Нода чата пропала надолго — переезд на резервный журнал.
             let after = *inner.failover_after.read().unwrap();

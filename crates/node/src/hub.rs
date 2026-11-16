@@ -7,6 +7,11 @@ use core_proto::msg::{LogEntry, PresenceUpdate, QueueMessage};
 use tokio::sync::broadcast;
 
 const CHANNEL_CAPACITY: usize = 64;
+/// Комната звонка: кадры идут потоком, отстающий подписчик теряет старые (это лучше задержки).
+const ROOM_CAPACITY: usize = 256;
+
+/// Кадр звонка: id соединения-отправителя (себе не пересылаем) + данные.
+pub type RoomFrame = (u64, Vec<u8>);
 
 /// Сообщение очереди + его внутренний порядковый номер (для дедупликации у подписчика).
 pub type QueueItem = (i64, QueueMessage);
@@ -16,6 +21,7 @@ pub struct Hub {
     queues: Mutex<HashMap<Vec<u8>, broadcast::Sender<QueueItem>>>,
     logs: Mutex<HashMap<Vec<u8>, broadcast::Sender<LogEntry>>>,
     presence: Mutex<HashMap<Vec<u8>, broadcast::Sender<PresenceUpdate>>>,
+    rooms: Mutex<HashMap<Vec<u8>, broadcast::Sender<RoomFrame>>>,
 }
 
 impl Hub {
@@ -41,6 +47,24 @@ impl Hub {
 
     pub fn publish_presence(&self, presence_id: &[u8], update: PresenceUpdate) {
         publish(&self.presence, presence_id, update)
+    }
+
+    pub fn join_room(&self, room_id: &[u8]) -> broadcast::Receiver<RoomFrame> {
+        self.rooms
+            .lock()
+            .unwrap()
+            .entry(room_id.to_vec())
+            .or_insert_with(|| broadcast::channel(ROOM_CAPACITY).0)
+            .subscribe()
+    }
+
+    pub fn publish_room(&self, room_id: &[u8], frame: RoomFrame) {
+        publish(&self.rooms, room_id, frame)
+    }
+
+    /// Сколько комнат сейчас открыто (для статистики).
+    pub fn rooms(&self) -> usize {
+        self.rooms.lock().unwrap().len()
     }
 }
 

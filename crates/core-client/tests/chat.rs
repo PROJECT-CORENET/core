@@ -408,3 +408,167 @@ async fn database_encryption() {
     let c = Client::open_with_key(&path, &node, Some(&key)).await.unwrap();
     assert_eq!(c.profile().unwrap().name, "Алиса");
 }
+
+/// Нода, которую можно уронить и поднять заново: тот же ключ, порт и база на диске.
+fn restartable_node(identity: &NodeIdentity, db: &std::path::Path, port: u16) -> (String, tokio::runtime::Runtime) {
+    let (identity, db) = (identity.clone(), db.to_path_buf());
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().unwrap();
+        let addr = rt.block_on(async {
+            let config = Config { listen: format!("127.0.0.1:{port}"), ..Config::default() };
+            let node = Node::bind(config, identity, Store::open(&db).unwrap()).await.unwrap();
+            let addr = node.address().to_string();
+            tokio::spawn(node.run());
+            addr
+        });
+        (addr, rt)
+    })
+    .join()
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retry_failed_message() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = NodeIdentity::generate();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let db = dir.path().join("node.db");
+    let (node, rt) = restartable_node(&identity, &db, port);
+
+    let alice = client(&dir, "Alice", &node).await;
+    let bob = client(&dir, "Bob", &node).await;
+    let (a_chat, link) = alice.create_chat(None).await.unwrap();
+    let b_chat = bob.accept_invite(&link).await.unwrap();
+    eventually("bob joins", || alice.chat(&a_chat).unwrap().title == "Bob").await;
+
+    // Нода упала — сообщение остаётся у Алисы с ошибкой, а не «отправляется» вечно.
+    rt.shutdown_background();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(alice.send_text(&a_chat, "Ты тут?", None, None).await.is_err());
+    let failed = alice.messages(&a_chat, 10, None).unwrap().pop().unwrap();
+    assert_eq!(failed.status, MessageStatus::Failed);
+    assert!(alice.retry_message(&failed.id).await.is_err(), "node is still down");
+    assert_eq!(alice.messages(&a_chat, 10, None).unwrap().pop().unwrap().status, MessageStatus::Failed);
+
+    // Нода вернулась — повтор доходит, у Боба сообщение одно (без дубликатов).
+    let (_, rt) = restartable_node(&identity, &db, port);
+    let mut sent = false;
+    for _ in 0..100 {
+        if alice.retry_message(&failed.id).await.is_ok() {
+            sent = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(sent, "retry after the node is back");
+    eventually("bob gets it once", || texts(&bob, &b_chat) == ["Ты тут?"]).await;
+    assert_ne!(alice.messages(&a_chat, 10, None).unwrap().pop().unwrap().status, MessageStatus::Failed);
+    // Повтор отправленного — ничего не делает.
+    alice.retry_message(&failed.id).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(texts(&bob, &b_chat), ["Ты тут?"]);
+    rt.shutdown_background();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blocked_member_is_ignored() {
+    let node = node().await;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = client(&dir, "Alice", &node).await;
+    let bob = client(&dir, "Bob", &node).await;
+    let (a_chat, link) = alice.create_chat(None).await.unwrap();
+    let b_chat = bob.accept_invite(&link).await.unwrap();
+    eventually("bob joins", || alice.chat(&a_chat).unwrap().title == "Bob").await;
+    let bob_id = alice.chat(&a_chat).unwrap().members.into_iter().find(|m| !m.is_me).unwrap().id;
+
+    // Заблокировали — его сообщения не приходят.
+    alice.set_app_setting(core_client::BLOCKED_KEY, &serde_json::to_string(&[&bob_id]).unwrap()).unwrap();
+    bob.send_text(&b_chat, "Спам", None, None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(texts(&alice, &a_chat).is_empty(), "blocked message is dropped");
+
+    // Разблокировали — снова приходят; сам он писать мог всё время.
+    alice.set_app_setting(core_client::BLOCKED_KEY, "[]").unwrap();
+    bob.send_text(&b_chat, "Привет", None, None).await.unwrap();
+    eventually("message after unblock", || texts(&alice, &a_chat) == ["Привет"]).await;
+}
+
+/// Шпион звонков: изменения и пришедшие кадры.
+#[derive(Default)]
+struct CallSpy {
+    changed: Mutex<Vec<String>>,
+    media: Mutex<Vec<(u8, Vec<u8>)>>,
+}
+
+impl Listener for CallSpy {
+    fn changed(&self, _: Option<String>) {}
+    fn call_changed(&self, call_id: String) {
+        self.changed.lock().unwrap().push(call_id);
+    }
+    fn call_media(&self, _call: String, _peer: String, kind: u8, data: Vec<u8>) {
+        self.media.lock().unwrap().push((kind, data));
+    }
+}
+
+/// Личный звонок: вызов → звонит у собеседника → ответ → звук и видео (большой кадр режется и
+/// собирается) → микрофон выключен → конец у обоих, история одинаковая; отклонённый вызов.
+#[tokio::test(flavor = "multi_thread")]
+async fn direct_call() {
+    use core_client::call_media;
+    let node = node().await;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = client(&dir, "Alice", &node).await;
+    let bob = client(&dir, "Bob", &node).await;
+    let (a_chat, link) = alice.create_chat(None).await.unwrap();
+    let b_chat = bob.accept_invite(&link).await.unwrap();
+    eventually("bob joins", || bob.chat(&b_chat).unwrap().state == ChatState::Active).await;
+    eventually("names", || alice.chat(&a_chat).unwrap().title == "Bob").await;
+    let (a_spy, b_spy) = (Arc::new(CallSpy::default()), Arc::new(CallSpy::default()));
+    alice.set_listener(a_spy.clone());
+    bob.set_listener(b_spy.clone());
+
+    let id = alice.start_call(&a_chat, true).await.unwrap();
+    assert_eq!(alice.call(&id).unwrap().state, "outgoing");
+    eventually("bob rings", || bob.call(&id).is_ok_and(|c| c.state == "ringing")).await;
+    let ring = bob.call(&id).unwrap();
+    assert!(!ring.outgoing && ring.video && !ring.group && ring.chat_id == b_chat);
+
+    bob.accept_call(&id).await.unwrap();
+    eventually("alice sees answer", || alice.call(&id).unwrap().state == "active").await;
+    eventually("peers see each other", || {
+        alice.call_peers(&id).len() == 1 && bob.call_peers(&id).first().is_some_and(|p| p.mic && p.cam)
+    })
+    .await;
+
+    // Звук и большой ключевой кадр видео (несколько частей) доходят целиком.
+    let frame: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+    alice.call_send(&id, call_media::AUDIO, b"opus-packet");
+    alice.call_send(&id, call_media::VIDEO_KEY, &frame);
+    eventually("media arrives", || {
+        let m = b_spy.media.lock().unwrap();
+        m.contains(&(call_media::AUDIO, b"opus-packet".to_vec())) && m.contains(&(call_media::VIDEO_KEY, frame.clone()))
+    })
+    .await;
+
+    // Боб выключил микрофон — Алиса видит.
+    bob.set_call_media(&id, false, true);
+    eventually("mute visible", || alice.call_peers(&id).first().is_some_and(|p| !p.mic)).await;
+
+    alice.end_call(&id).await.unwrap();
+    eventually("bob sees end", || bob.call(&id).unwrap().state == "ended").await;
+    assert_eq!(alice.call(&id).unwrap().result, "answered");
+    assert_eq!(bob.call(&id).unwrap().result, "answered");
+    assert!(bob.call_peers(&id).is_empty());
+    assert_eq!(bob.calls(10).unwrap().len(), 1, "history on both sides");
+
+    // Отклонённый вызов: у звонящего «отклонён», у обоих в истории.
+    let id2 = bob.start_call(&b_chat, false).await.unwrap();
+    eventually("alice rings", || alice.call(&id2).is_ok_and(|c| c.state == "ringing")).await;
+    alice.decline_call(&id2).await.unwrap();
+    eventually("bob sees decline", || bob.call(&id2).unwrap().result == "declined").await;
+    assert_eq!(bob.call(&id2).unwrap().state, "ended");
+    assert_eq!(alice.calls(10).unwrap().len(), 2);
+    alice.hide_calls(std::slice::from_ref(&id2)).unwrap();
+    assert_eq!(alice.calls(10).unwrap().len(), 1);
+    assert!(!a_spy.changed.lock().unwrap().is_empty());
+}

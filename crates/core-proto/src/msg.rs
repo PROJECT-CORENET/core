@@ -47,7 +47,10 @@ pub struct Request {
     /// Ed25519-подпись над [`Request::signing_bytes`]. Пусто для неподписываемых команд.
     #[prost(bytes = "vec", tag = "2")]
     pub auth_sig: Vec<u8>,
-    #[prost(oneof = "request::Body", tags = "10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 30, 31, 32, 40, 41")]
+    #[prost(
+        oneof = "request::Body",
+        tags = "10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 30, 31, 32, 40, 41, 50, 51, 52"
+    )]
     pub body: Option<request::Body>,
 }
 
@@ -92,6 +95,14 @@ pub mod request {
         PresencePut(PresencePut),
         #[prost(message, tag = "41")]
         PresenceWatch(PresenceWatch),
+        /// Звонки (только в медиа-соединении): войти в комнату, выйти, переслать кадр остальным.
+        #[prost(message, tag = "50")]
+        RelayJoin(RelayJoin),
+        #[prost(message, tag = "51")]
+        RelayLeave(RelayLeave),
+        /// Без ответа (`corr_id = 0`): кадр звонка не ждёт подтверждения.
+        #[prost(message, tag = "52")]
+        RelaySend(RelaySend),
     }
 }
 
@@ -320,7 +331,7 @@ pub struct LogEntry {
 
 #[derive(Clone, PartialEq, Message)]
 pub struct Event {
-    #[prost(oneof = "event::Body", tags = "1, 2, 3, 4")]
+    #[prost(oneof = "event::Body", tags = "1, 2, 3, 4, 5")]
     pub body: Option<event::Body>,
 }
 
@@ -338,6 +349,9 @@ pub mod event {
         /// Gossip от ноды-соседа, которая приняла наше соединение (§6.4).
         #[prost(message, tag = "4")]
         Gossip(Gossip),
+        /// Кадр звонка от другого участника комнаты.
+        #[prost(message, tag = "5")]
+        RelayFrame(RelayFrame),
     }
 }
 
@@ -371,6 +385,44 @@ pub struct Unsubscribe {
 }
 
 pub const PRESENCE_ID_LEN: usize = 16;
+
+// ───── Звонки: комната-ретранслятор ─────
+//
+// Нода пересылает кадры участникам комнаты и ничего не хранит. Содержимое зашифровано
+// ключом звонка (его знают только участники чата — он приходит внутри MLS). Id комнаты
+// случайный; нода не знает, чей это звонок.
+
+pub const ROOM_ID_LEN: usize = 16;
+/// Сколько комнат одновременно в одном медиа-соединении (групповой звонок — одна комната).
+pub const MAX_ROOMS_PER_CONN: usize = 4;
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RelayJoin {
+    #[prost(bytes = "vec", tag = "1")]
+    pub room_id: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RelayLeave {
+    #[prost(bytes = "vec", tag = "1")]
+    pub room_id: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RelaySend {
+    #[prost(bytes = "vec", tag = "1")]
+    pub room_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct RelayFrame {
+    #[prost(bytes = "vec", tag = "1")]
+    pub room_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub data: Vec<u8>,
+}
 /// Максимальный размер зашифрованного статуса.
 pub const MAX_PRESENCE_SEALED: usize = 1024;
 pub const MAX_PRESENCE_WATCH: usize = 256;

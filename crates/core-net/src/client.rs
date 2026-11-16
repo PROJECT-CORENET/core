@@ -31,7 +31,16 @@ pub struct Client {
 impl Client {
     /// Подключиться к ноде. Возвращает клиента и поток событий (сообщения очередей, записи журналов).
     pub async fn connect(addr: &NodeAddr) -> Result<(Self, mpsc::Receiver<Event>), NetError> {
-        let session = session::connect(addr).await?;
+        Self::connect_mode(addr, session::Mode::Normal).await
+    }
+
+    /// Медиа-соединение для звонков (мелкие кадры, только команды комнат).
+    pub async fn connect_media(addr: &NodeAddr) -> Result<(Self, mpsc::Receiver<Event>), NetError> {
+        Self::connect_mode(addr, session::Mode::Media).await
+    }
+
+    async fn connect_mode(addr: &NodeAddr, mode: session::Mode) -> Result<(Self, mpsc::Receiver<Event>), NetError> {
+        let session = session::connect_mode(addr, mode).await?;
         let pending: Pending = Arc::default();
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
         let reader_task = tokio::spawn(read_loop(session.reader, pending.clone(), events_tx));
@@ -89,6 +98,12 @@ impl Client {
             Some(body) => Ok(body),
             None => Err(NetError::Protocol("empty response".into())),
         }
+    }
+
+    /// Команда без ответа (`corr_id = 0`) — кадры звонка: подтверждение каждого удвоило бы трафик.
+    pub async fn send_oneway(&self, body: request::Body) -> Result<(), NetError> {
+        let req = Request { corr_id: 0, auth_sig: vec![], body: Some(body) };
+        self.writer.lock().await.send(FrameType::Request, &req.encode_to_vec()).await
     }
 
     fn next_corr_id(&self) -> u64 {

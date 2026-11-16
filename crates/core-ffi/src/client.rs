@@ -30,6 +30,10 @@ pub trait CoreListener: Send + Sync {
     /// Другое устройство аккаунта изменило настройку приложения `key` (`devices` — список устройств,
     /// `removed` — это устройство отключили, `*` — всё сразу после связывания).
     fn synced(&self, key: String);
+    /// Звонок изменился (вызов, ответ, конец, участники, микрофон/камера).
+    fn call_changed(&self, call_id: String);
+    /// Кадр звонка: `kind` 1 — звук (Opus), 2 — видео, 3 — ключевой кадр видео, 4 — просьба о ключевом кадре.
+    fn call_media(&self, call_id: String, peer: String, kind: u8, data: Vec<u8>);
 }
 
 struct ListenerBridge(Arc<dyn CoreListener>);
@@ -46,6 +50,59 @@ impl cc::Listener for ListenerBridge {
     fn synced(&self, key: String) {
         self.0.synced(key);
     }
+
+    fn call_changed(&self, call_id: String) {
+        self.0.call_changed(call_id);
+    }
+
+    fn call_media(&self, call_id: String, peer: String, kind: u8, data: Vec<u8>) {
+        self.0.call_media(call_id, peer, kind, data);
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CallInfo {
+    pub id: String,
+    pub chat_id: String,
+    pub initiator: String,
+    pub outgoing: bool,
+    pub video: bool,
+    pub group: bool,
+    pub ts_ms: u64,
+    pub joined_ms: Option<u64>,
+    pub ended_ms: Option<u64>,
+    /// ringing | outgoing | active | ongoing | ended
+    pub state: String,
+    /// answered | missed | declined (пусто, пока идёт)
+    pub result: String,
+    pub members: Vec<String>,
+}
+
+impl From<cc::Call> for CallInfo {
+    fn from(c: cc::Call) -> Self {
+        Self {
+            id: c.id,
+            chat_id: c.chat_id,
+            initiator: c.initiator,
+            outgoing: c.outgoing,
+            video: c.video,
+            group: c.group,
+            ts_ms: c.ts,
+            joined_ms: c.joined_ms,
+            ended_ms: c.ended_ms,
+            state: c.state,
+            result: c.result,
+            members: c.members,
+        }
+    }
+}
+
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct CallPeerInfo {
+    pub peer: String,
+    pub member_id: String,
+    pub mic: bool,
+    pub cam: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -371,6 +428,28 @@ pub async fn open_client(dir: String, node: String, db_key: Option<Vec<u8>>) -> 
     Ok(Arc::new(CoreClient { inner }))
 }
 
+/// Писать журнал ядра в файл (`RUST_LOG`-фильтр, по умолчанию info). Повторный вызов ничего не делает.
+/// Файл больше 4 МБ при старте начинается заново.
+#[uniffi::export]
+pub fn init_logging(path: String) {
+    use std::sync::Mutex;
+    use tracing_subscriber::EnvFilter;
+    if std::fs::metadata(&path).map(|m| m.len() > 4 << 20).unwrap_or(false) {
+        let _ = std::fs::remove_file(&path);
+    }
+    let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else { return };
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let ok = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(false)
+        .with_writer(Mutex::new(file))
+        .try_init()
+        .is_ok();
+    if ok {
+        tracing::info!("📝 core log started");
+    }
+}
+
 /// Похоже ли на ссылку-приглашение (для вставки из буфера).
 #[uniffi::export]
 pub fn is_invite_link(text: String) -> bool {
@@ -553,6 +632,11 @@ impl CoreClient {
         Ok(self.inner.react(&message_id, emoji.as_deref()).await?)
     }
 
+    /// Повторить отправку сообщения с ошибкой (выгрузит вложение, если оно не ушло).
+    pub async fn retry_message(&self, message_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.retry_message(&message_id).await?)
+    }
+
     pub async fn delete_message_for_all(&self, message_id: String) -> Result<(), CoreError> {
         Ok(self.inner.delete_message_for_all(&message_id).await?)
     }
@@ -593,6 +677,53 @@ impl CoreClient {
         Ok(self.inner.link_send_account(&channel.inner).await?)
     }
 
+    // ── звонки ──
+
+    pub async fn start_call(&self, chat_id: String, video: bool) -> Result<String, CoreError> {
+        Ok(self.inner.start_call(&chat_id, video).await?)
+    }
+
+    pub async fn accept_call(&self, call_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.accept_call(&call_id).await?)
+    }
+
+    pub async fn decline_call(&self, call_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.decline_call(&call_id).await?)
+    }
+
+    pub async fn end_call(&self, call_id: String) -> Result<(), CoreError> {
+        Ok(self.inner.end_call(&call_id).await?)
+    }
+
+    /// Кадр звонка (без ожидания): `kind` как у `CoreListener::call_media`.
+    pub fn call_send(&self, call_id: String, kind: u8, data: Vec<u8>) {
+        self.inner.call_send(&call_id, kind, &data)
+    }
+
+    pub fn set_call_media(&self, call_id: String, mic: bool, cam: bool) {
+        self.inner.set_call_media(&call_id, mic, cam)
+    }
+
+    pub fn call(&self, call_id: String) -> Result<CallInfo, CoreError> {
+        Ok(self.inner.call(&call_id)?.into())
+    }
+
+    pub fn calls(&self, limit: u32) -> Result<Vec<CallInfo>, CoreError> {
+        Ok(self.inner.calls(limit)?.into_iter().map(Into::into).collect())
+    }
+
+    pub fn call_peers(&self, call_id: String) -> Vec<CallPeerInfo> {
+        self.inner
+            .call_peers(&call_id)
+            .into_iter()
+            .map(|p| CallPeerInfo { peer: p.peer, member_id: p.member_id, mic: p.mic, cam: p.cam })
+            .collect()
+    }
+
+    pub fn hide_calls(&self, ids: Vec<String>) -> Result<(), CoreError> {
+        Ok(self.inner.hide_calls(&ids)?)
+    }
+
     /// Общая для всех устройств настройка приложения (JSON).
     pub fn set_app_setting(&self, key: String, value: String) -> Result<(), CoreError> {
         Ok(self.inner.set_app_setting(&key, &value)?)
@@ -625,6 +756,11 @@ impl CoreClient {
 
     pub async fn remove_device(&self, device_id: String) -> Result<(), CoreError> {
         Ok(self.inner.remove_device(&device_id).await?)
+    }
+
+    /// Доля переданного вложения сообщения (0…1) или `None`, если передачи сейчас нет.
+    pub fn transfer_progress(&self, message_id: String) -> Option<f32> {
+        self.inner.transfer_progress(&message_id)
     }
 
     /// Это устройство отключили с другого — нужно стереть данные.

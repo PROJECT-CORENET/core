@@ -241,10 +241,11 @@ pub(crate) async fn publisher_loop(state: Arc<State>) {
             state.peers.broadcast(&g, None);
         }
         info!(
-            "📡 gossip tick: peers={} known_nodes={known} online_nodes={online} clients={} presence_online={}",
+            "📡 gossip tick: peers={} known_nodes={known} online_nodes={online} clients={} presence_online={} call_rooms={}",
             state.peers.node_ids().len(),
             state.clients.load(Ordering::Relaxed),
             state.presence.lock().unwrap().online_count(),
+            state.hub.rooms(),
         );
     }
 }

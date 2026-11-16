@@ -152,10 +152,52 @@ CREATE INDEX IF NOT EXISTS messages_chat ON messages (chat_id, seq);
 CREATE TABLE IF NOT EXISTS reactions (
     msg_id TEXT NOT NULL, sender_id TEXT NOT NULL, emoji TEXT NOT NULL, ts INTEGER NOT NULL,
     PRIMARY KEY (msg_id, sender_id));
+-- Звонки (история): одинакова на всех устройствах — строится из сигналинга в журнале чата.
+-- result: '' — идёт / звонит, answered, missed, declined, cancelled. members — кто сейчас в звонке (JSON).
+CREATE TABLE IF NOT EXISTS calls (
+    id TEXT PRIMARY KEY, chat_id TEXT NOT NULL, initiator TEXT NOT NULL, video INTEGER NOT NULL,
+    ts INTEGER NOT NULL, room BLOB NOT NULL, key BLOB NOT NULL, joined_ms INTEGER, ended_ms INTEGER,
+    result TEXT NOT NULL DEFAULT '', members TEXT NOT NULL DEFAULT '[]', hidden INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS calls_ts ON calls (ts);
 CREATE TABLE IF NOT EXISTS mirrors (
     chat_id TEXT PRIMARY KEY, node TEXT NOT NULL, log_id BLOB NOT NULL, write_sk BLOB NOT NULL,
     read_sk BLOB NOT NULL, read_offset INTEGER NOT NULL DEFAULT 0);
 ";
+
+const CALL_COLS: &str = "id, chat_id, initiator, video, ts, room, key, joined_ms, ended_ms, result, members";
+
+#[derive(Clone, Debug)]
+pub struct CallRow {
+    pub id: String,
+    pub chat_id: String,
+    pub initiator: String,
+    pub video: bool,
+    pub ts: u64,
+    pub room: Vec<u8>,
+    pub key: Vec<u8>,
+    /// Когда разговор начался (кто-то ответил).
+    pub joined_ms: Option<u64>,
+    pub ended_ms: Option<u64>,
+    pub result: String,
+    /// Кто сейчас в звонке (по сигналингу).
+    pub members: Vec<String>,
+}
+
+fn call_row(r: &Row) -> Result<CallRow> {
+    Ok(CallRow {
+        id: r.get(0)?,
+        chat_id: r.get(1)?,
+        initiator: r.get(2)?,
+        video: r.get(3)?,
+        ts: r.get::<_, i64>(4)? as u64,
+        room: r.get(5)?,
+        key: r.get(6)?,
+        joined_ms: r.get::<_, Option<i64>>(7)?.map(|v| v as u64),
+        ended_ms: r.get::<_, Option<i64>>(8)?.map(|v| v as u64),
+        result: r.get(9)?,
+        members: serde_json::from_str(&r.get::<_, String>(10)?).unwrap_or_default(),
+    })
+}
 
 const CHAT_COLS: &str = "id, group_id, title, custom_title, node, log_id, write_sk, read_sk, read_offset, state, \
                          created_ms, last_ms, unread, muted, pinned";
@@ -214,6 +256,31 @@ fn queue_row(r: &Row) -> Result<QueueRow> {
 impl Store {
     /// `key` — ключ SQLCipher (32 байта). Старая незашифрованная база шифруется на месте.
     pub fn open(path: &Path, key: Option<&[u8]>) -> Result<Self> {
+        // Сбой при открытии бывает временным (прошлый процесс ещё закрывает базу) — пробуем ещё.
+        // Неверный ключ (своя формулировка) повторять незачем: его проверка уже с повторами.
+        let mut attempt = 0;
+        loop {
+            match Self::open_once(path, key) {
+                Err(rusqlite::Error::SqliteFailure(e, msg))
+                    if attempt < 4
+                        && msg.as_deref() != Some("wrong database key")
+                        && matches!(
+                            e.code,
+                            rusqlite::ErrorCode::NotADatabase
+                                | rusqlite::ErrorCode::DatabaseBusy
+                                | rusqlite::ErrorCode::DatabaseLocked
+                        ) =>
+                {
+                    attempt += 1;
+                    tracing::warn!("⚠️ database open failed ({e}), retry {attempt}");
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+                other => return other,
+            }
+        }
+    }
+
+    fn open_once(path: &Path, key: Option<&[u8]>) -> Result<Self> {
         let conn = match key {
             Some(key) => Self::open_encrypted(path, key)?,
             None => Connection::open(path)?,
@@ -241,12 +308,22 @@ impl Store {
 
     fn open_encrypted(path: &Path, key: &[u8]) -> Result<Connection> {
         let pragma = format!("PRAGMA key = \"x'{}'\";", hex::encode(key));
-        let conn = Connection::open(path)?;
-        conn.execute_batch(&pragma)?;
-        if conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).is_ok() {
-            return Ok(conn);
+        // Несколько попыток: пока прошлый процесс приложения дописывает журнал (WAL) при закрытии,
+        // SQLCipher отвечает «file is not a database» — как при неверном ключе, хотя база цела.
+        for attempt in 0..6 {
+            let conn = Connection::open(path)?;
+            conn.execute_batch(&pragma)?;
+            if conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).is_ok() {
+                if attempt > 0 {
+                    tracing::info!("🔐 database opened on attempt {}", attempt + 1);
+                }
+                return Ok(conn);
+            }
+            drop(conn);
+            if attempt < 5 {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
         }
-        drop(conn);
         // Не открылась с ключом: либо это старая открытая база, либо ключ неверный.
         let plain = Connection::open(path)?;
         if plain.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0)).is_err() {
@@ -271,6 +348,59 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.execute_batch(&pragma)?;
         Ok(conn)
+    }
+
+    // ── звонки ──
+
+    /// Новый вызов; повтор (догон истории, второе устройство) ничего не меняет. `true` — вставлен.
+    pub fn insert_call(&self, call: &CallRow) -> Result<bool> {
+        self.with(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO calls (id, chat_id, initiator, video, ts, room, key) VALUES (?,?,?,?,?,?,?)",
+                params![call.id, call.chat_id, call.initiator, call.video, call.ts as i64, call.room, call.key],
+            )
+            .map(|n| n > 0)
+        })
+    }
+
+    pub fn call(&self, id: &str) -> Result<Option<CallRow>> {
+        self.with(|c| c.query_row(&format!("SELECT {CALL_COLS} FROM calls WHERE id = ?"), [id], call_row).optional())
+    }
+
+    /// История: новые сверху, скрытые пользователем — нет.
+    pub fn calls(&self, limit: u32) -> Result<Vec<CallRow>> {
+        self.with(|c| {
+            let mut stmt =
+                c.prepare(&format!("SELECT {CALL_COLS} FROM calls WHERE hidden = 0 ORDER BY ts DESC LIMIT ?"))?;
+            let rows = stmt.query_map([limit], call_row)?;
+            rows.collect()
+        })
+    }
+
+    pub fn update_call(&self, call: &CallRow) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE calls SET joined_ms = ?, ended_ms = ?, result = ?, members = ? WHERE id = ?",
+                params![
+                    call.joined_ms.map(|v| v as i64),
+                    call.ended_ms.map(|v| v as i64),
+                    call.result,
+                    serde_json::to_string(&call.members).unwrap(),
+                    call.id
+                ],
+            )
+            .map(drop)
+        })
+    }
+
+    /// Убрать из истории (только на этом устройстве; звонок в журнале остаётся).
+    pub fn hide_calls(&self, ids: &[String]) -> Result<()> {
+        self.with(|c| {
+            for id in ids {
+                c.execute("UPDATE calls SET hidden = 1 WHERE id = ?", [id])?;
+            }
+            Ok(())
+        })
     }
 
     fn with<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -781,7 +911,99 @@ impl Store {
         })
     }
 
+    /// Каталог данных мог переехать (на iOS путь к песочнице меняется при каждой переустановке):
+    /// пути к файлам вложений переносятся в текущий `media` — по имени файла, если он там есть.
+    pub fn rebase_media(&self, media: &Path) -> Result<usize> {
+        self.with(|c| {
+            let rows: Vec<(String, String)> = {
+                let mut stmt = c.prepare("SELECT id, file_path FROM messages WHERE file_path IS NOT NULL")?;
+                let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<Result<_>>()?
+            };
+            let mut moved = 0;
+            for (id, old) in rows {
+                let Some(name) = Path::new(&old).file_name() else { continue };
+                let new = media.join(name);
+                if new != Path::new(&old) && new.exists() {
+                    c.execute("UPDATE messages SET file_path = ? WHERE id = ?", params![new.to_string_lossy(), id])?;
+                    moved += 1;
+                }
+            }
+            Ok(moved)
+        })
+    }
+
+    /// Свои неотправленные сообщения за последние сутки (ошибка или «отправляется» после перезапуска), старые первыми.
+    pub fn unsent_outgoing(&self) -> Result<Vec<String>> {
+        let since = crate::now_ms().saturating_sub(24 * 60 * 60 * 1000) as i64;
+        self.with(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id FROM messages WHERE outgoing = 1 AND status IN (0, 3) AND ts >= ? ORDER BY ts ASC, seq ASC",
+            )?;
+            let rows = stmt.query_map([since], |r| r.get(0))?;
+            rows.collect()
+        })
+    }
+
+    /// Сообщения с вложением, которого нет на устройстве (новые сначала), — для догрузки.
+    pub fn missing_media(&self, limit: u32) -> Result<Vec<MessageRow>> {
+        self.with(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {MSG_COLS} FROM messages WHERE attachment IS NOT NULL AND file_path IS NULL AND status != 0 \
+                 ORDER BY ts DESC LIMIT ?"
+            ))?;
+            let rows = stmt.query_map([limit], message_row)?;
+            rows.collect()
+        })
+    }
+
     pub fn clear_file_paths_for(&self, path: &str) -> Result<()> {
         self.with(|c| c.execute("UPDATE messages SET file_path = NULL WHERE file_path = ?", [path]).map(drop))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(id: &str, path: Option<&str>) -> MessageRow {
+        MessageRow {
+            id: id.into(),
+            chat_id: "c".into(),
+            sender_id: "me".into(),
+            outgoing: true,
+            ts: 1,
+            text: String::new(),
+            attachment: Some(AttachmentRef { kind: "photo".into(), name: "a.jpg".into(), ..Default::default() }),
+            status: MessageStatus::Sent,
+            file_path: path.map(Into::into),
+            reply_to: None,
+            link: None,
+            fwd: None,
+            fwd_id: None,
+        }
+    }
+
+    #[test]
+    fn media_paths_follow_moved_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("media");
+        std::fs::create_dir_all(&media).unwrap();
+        std::fs::write(media.join("m1.jpg"), b"x").unwrap();
+        let store = Store::open(&dir.path().join("client.db"), None).unwrap();
+        // Старый путь песочницы (до переустановки) — файл на месте, но под другим каталогом.
+        store.insert_message(&message("m1", Some("/old/sandbox/media/m1.jpg"))).unwrap();
+        store.insert_message(&message("m2", Some("/old/sandbox/media/m2.jpg"))).unwrap();
+        store.insert_message(&message("m3", None)).unwrap();
+
+        assert_eq!(store.rebase_media(&media).unwrap(), 1);
+        let m1 = store.message("m1").unwrap().unwrap();
+        assert_eq!(m1.file_path.as_deref(), Some(media.join("m1.jpg").to_str().unwrap()));
+        // Файла нет — путь не трогаем; повтор ничего не меняет.
+        assert_eq!(store.message("m2").unwrap().unwrap().file_path.as_deref(), Some("/old/sandbox/media/m2.jpg"));
+        assert_eq!(store.rebase_media(&media).unwrap(), 0);
+
+        let missing: Vec<String> = store.missing_media(10).unwrap().into_iter().map(|m| m.id).collect();
+        assert_eq!(missing, vec!["m3".to_string()]);
     }
 }

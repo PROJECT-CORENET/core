@@ -26,6 +26,8 @@ use core_proto::msg::{request, response, LogCommit};
 
 const DEVICE_SIG_KEY: &str = "device.sig";
 const SNAPSHOT_FILE: &str = "link-snapshot.json";
+/// Сколько ждать ноду одного чата при связывании устройств.
+const LINK_CHAT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 /// Это устройство отключили с другого — приложение должно стереть данные.
 const DEVICE_REMOVED_KEY: &str = "device.removed";
 const APP_PREFIX: &str = "app.";
@@ -161,7 +163,7 @@ impl Inner {
     /// Отправить операцию остальным устройствам (в фоне; без других устройств — ничего).
     pub(crate) fn sync(self: &Arc<Self>, op: SyncOp) {
         let inner = self.clone();
-        tokio::spawn(async move {
+        self.rt.spawn(async move {
             let Some(saved) = inner.saved_row() else { return };
             if !inner.has_other_devices(&saved).await {
                 return;
@@ -182,7 +184,7 @@ impl Inner {
     /// Новый чат на этом устройстве — остальные устройства вступают по ссылке.
     pub(crate) fn announce_chat(self: &Arc<Self>, chat_id: &str) {
         let (inner, chat_id) = (self.clone(), chat_id.to_string());
-        tokio::spawn(async move {
+        self.rt.spawn(async move {
             let Some(saved) = inner.saved_row() else { return };
             if saved.id == chat_id || !inner.has_other_devices(&saved).await {
                 return;
@@ -203,7 +205,7 @@ impl Inner {
     /// Другое своё устройство завело чат — вступаем, если ещё не там.
     pub(crate) fn join_synced_chat(self: &Arc<Self>, link: String, gid: String) {
         let inner = self.clone();
-        tokio::spawn(async move {
+        self.rt.spawn(async move {
             let known = inner.chat_by_gid(&gid).ok().flatten().is_some()
                 || inner.store.get(&synced_key(&gid)).ok().flatten().is_some();
             if known {
@@ -565,14 +567,29 @@ impl Client {
                 .collect(),
             ..Default::default()
         };
+        // Ссылки на все чаты — разом: чат на недоступной ноде ждёт таймаута, остальных он не задерживает.
+        let started = std::time::Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
         for row in inner.store.chats()?.into_iter().filter(|c| c.state == ChatState::Active) {
-            let link = match inner.invite_link(&row.id).await {
-                Ok(l) => l,
-                Err(e) => {
-                    warn!("⚠️ link: chat {} skipped: {e}", row.id);
-                    continue;
+            let inner = inner.clone();
+            tasks.spawn(async move {
+                let link = tokio::time::timeout(LINK_CHAT_TIMEOUT, inner.invite_link(&row.id)).await;
+                (row, link)
+            });
+        }
+        let mut rows = Vec::new();
+        while let Some(done) = tasks.join_next().await {
+            let Ok((row, link)) = done else { continue };
+            match link {
+                Ok(Ok(link)) => rows.push((row, link)),
+                Ok(Err(e)) => warn!("⚠️ link: chat {} skipped: {e}", row.id),
+                Err(_) => {
+                    warn!("⏱️ link: chat {} skipped — its node {} did not answer", row.id, crate::short(&row.node))
                 }
-            };
+            }
+        }
+        info!("🔗 link: invites for {} chats in {:?}", rows.len(), started.elapsed());
+        for (row, link) in rows {
             let chat = inner.snap_chat(&row, link)?;
             if row.id == saved_id {
                 snap.saved = Some(chat);
@@ -592,9 +609,11 @@ impl Client {
             size,
             ..Default::default()
         };
-        let uploaded = media::upload(&ch.conn, &ch.node, &path, &mut att).await;
+        let started = std::time::Instant::now();
+        let uploaded = media::upload(&ch.conn, &ch.node, &path, &mut att, None).await;
         let _ = std::fs::remove_file(&path);
         uploaded?;
+        info!("📤 link snapshot uploaded: {} KB in {:?}", size / 1024, started.elapsed());
 
         ch.send(&LinkMsg::Account { account_id: inner.me.clone(), snapshot: Box::new(att) }).await?;
         let reply = ch.recv(Duration::from_secs(180)).await;
@@ -641,21 +660,46 @@ impl Client {
                 Err(e) => warn!("⚠️ joining saved messages failed: {e}"),
             }
         }
-        let mut joined = 0;
-        for chat in &snap.chats {
+        // Остальные чаты — параллельно: недоступная нода одного чата не задерживает другие.
+        let started = std::time::Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
+        for chat in snap.chats {
             if inner.chat_by_gid(&chat.gid).ok().flatten().is_some() {
                 continue;
             }
-            match inner.accept_invite(&chat.link, Some(&chat.gid)).await {
-                Ok(id) => {
-                    joined += 1;
-                    if let Err(e) = inner.import_chat(&id, chat) {
-                        warn!("⚠️ history import for chat {id} failed: {e}");
+            let inner = inner.clone();
+            tasks.spawn(async move {
+                let joined =
+                    tokio::time::timeout(LINK_CHAT_TIMEOUT, inner.accept_invite(&chat.link, Some(&chat.gid))).await;
+                match joined {
+                    Ok(Ok(id)) => {
+                        if let Err(e) = inner.import_chat(&id, &chat) {
+                            warn!("⚠️ history import for chat {id} failed: {e}");
+                        }
+                        inner.notify(Some(id.clone()));
+                        true
+                    }
+                    Ok(Err(e)) => {
+                        warn!("⚠️ joining chat failed: {e}");
+                        false
+                    }
+                    Err(_) => {
+                        warn!(
+                            "⏱️ joining chat {} skipped — its node did not answer",
+                            &chat.gid[..chat.gid.len().min(12)]
+                        );
+                        false
                     }
                 }
-                Err(e) => warn!("⚠️ joining chat failed: {e}"),
+            });
+        }
+        let mut joined = 0;
+        while let Some(done) = tasks.join_next().await {
+            if done.unwrap_or(false) {
+                joined += 1;
             }
         }
+        info!("🔗 link: joined {joined} chats in {:?}", started.elapsed());
         let _ = inner.store.delete(LINK_PENDING_KEY);
         let _ = std::fs::remove_file(&path);
         info!("✅ link finished: joining {joined} chats");
@@ -691,7 +735,7 @@ pub async fn link_receive_account(ch: &LinkChannel, dir: &Path, db_key: Option<&
     };
     std::fs::create_dir_all(dir.join("media")).map_err(|e| Error::Other(e.to_string()))?;
     let path = dir.join(SNAPSHOT_FILE);
-    media::download(&ch.conn, &snapshot, &path).await?;
+    media::download(&ch.conn, &snapshot, &path, None).await?;
     let snap: Snapshot = serde_json::from_slice(&std::fs::read(&path).map_err(|e| Error::Other(e.to_string()))?)
         .map_err(|e| Error::Other(format!("bad snapshot: {e}")))?;
 

@@ -2,18 +2,18 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use core_directory::{verify_descriptor, verify_session, Directory, NodeId};
 use core_net::{NetError, NodeAddr};
-use core_proto::frame::{FrameType, MAX_BODY};
+use core_proto::frame::{FrameType, MAX_BODY, MEDIA_MAX_BODY};
 use core_proto::msg::{
     event, request, response, CommitConflict, Done, ErrorCode, ErrorReply, Event, Gossip, LogAppended, LogEntries,
-    LogEntry, LogEvent, NetSnapshotReply, NodeDescriptor, PeerWelcome, Pong, QueueCreated, Request, Response,
-    LOG_ID_LEN, MAX_BLOB, MAX_PRESENCE_SEALED, MAX_PRESENCE_WATCH, MSG_ID_LEN, PRESENCE_ID_LEN, PUBLIC_KEY_LEN,
-    QUEUE_ID_LEN,
+    LogEntry, LogEvent, NetSnapshotReply, NodeDescriptor, PeerWelcome, Pong, QueueCreated, RelayFrame, Request,
+    Response, LOG_ID_LEN, MAX_BLOB, MAX_PRESENCE_SEALED, MAX_PRESENCE_WATCH, MAX_ROOMS_PER_CONN, MSG_ID_LEN,
+    PRESENCE_ID_LEN, PUBLIC_KEY_LEN, QUEUE_ID_LEN, ROOM_ID_LEN,
 };
 use prost::Message;
 use tokio::net::{TcpListener, TcpStream};
@@ -39,6 +39,10 @@ const SUB_QUEUE: u8 = 0;
 const SUB_LOG: u8 = 1;
 const SUB_PRESENCE: u8 = 2;
 const SUB_PEER_LINK: u8 = 3;
+const SUB_ROOM: u8 = 4;
+
+/// Номера соединений — чтобы не пересылать кадр звонка его же отправителю.
+static NEXT_CONN: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct State {
     pub identity: NodeIdentity,
@@ -180,6 +184,9 @@ struct Conn {
     subscriptions: HashMap<Vec<u8>, JoinHandle<()>>,
     /// Если это соседняя нода: её node_id и ID связи в `Peers`.
     peer: Option<(NodeId, u64)>,
+    /// Медиа-соединение звонка: только команды комнат.
+    media: bool,
+    id: u64,
 }
 
 fn sub_key(kind: u8, id: &[u8]) -> Vec<u8> {
@@ -193,8 +200,12 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> Result<(), N
     let session = core_net::accept(stream, &state.identity.noise.private).await?;
     let mut reader = session.reader;
     let mut writer = session.writer;
+    let media = session.mode == core_net::session::Mode::Media;
     state.connections.fetch_add(1, Ordering::Relaxed);
-    state.clients.fetch_add(1, Ordering::Relaxed);
+    // Медиа-соединение — второе соединение того же клиента, в счётчик клиентов не входит.
+    if !media {
+        state.clients.fetch_add(1, Ordering::Relaxed);
+    }
 
     let (out, mut out_rx) = mpsc::channel::<(FrameType, Vec<u8>)>(OUTBOUND_QUEUE);
     let writer_task = tokio::spawn(async move {
@@ -212,6 +223,8 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> Result<(), N
         out,
         subscriptions: HashMap::new(),
         peer: None,
+        media,
+        id: NEXT_CONN.fetch_add(1, Ordering::Relaxed),
     };
 
     let result = loop {
@@ -228,6 +241,10 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> Result<(), N
             Err(e) => break Err(e.into()),
         };
         let resp = conn.handle(&req);
+        // `corr_id = 0` — команда без ответа (кадры звонка).
+        if req.corr_id == 0 {
+            continue;
+        }
         if conn.out.send((FrameType::Response, resp.encode_to_vec())).await.is_err() {
             break Ok(());
         }
@@ -241,9 +258,10 @@ async fn handle_connection(state: Arc<State>, stream: TcpStream) -> Result<(), N
             state.peers.unregister(link);
             info!("💔 peer disconnected (inbound) node={}", short_id(&node_id));
         }
-        None => {
+        None if !media => {
             state.clients.fetch_sub(1, Ordering::Relaxed);
         }
+        None => {}
     }
     state.connections.fetch_sub(1, Ordering::Relaxed);
     drop(conn);
@@ -322,8 +340,42 @@ impl Conn {
         let store = &self.state.store;
         let now = now_ms();
 
+        // Медиа-соединение — только для звонков; обычное — без команд комнат.
+        let relay = matches!(body, B::RelayJoin(_) | B::RelayLeave(_) | B::RelaySend(_));
+        if self.media != relay && !matches!(body, B::Ping(_)) {
+            return Err(Fail::bad("command is not allowed on this connection"));
+        }
+
         match body {
             B::Ping(_) => Ok(R::Pong(Pong { time_ms: now })),
+
+            // ───── Звонки ─────
+            B::RelayJoin(c) => {
+                check_len(&c.room_id, ROOM_ID_LEN, "room_id")?;
+                let joined = self.subscriptions.keys().filter(|k| k.first() == Some(&SUB_ROOM)).count();
+                if joined >= MAX_ROOMS_PER_CONN && !self.subscriptions.contains_key(&sub_key(SUB_ROOM, &c.room_id)) {
+                    return Err(Fail(ErrorCode::QuotaExceeded, format!("max {MAX_ROOMS_PER_CONN} rooms")));
+                }
+                self.join_room(c.room_id.clone());
+                Ok(R::Done(Done {}))
+            }
+
+            B::RelayLeave(c) => {
+                self.unsubscribe(SUB_ROOM, &c.room_id);
+                Ok(R::Done(Done {}))
+            }
+
+            B::RelaySend(c) => {
+                // Слать можно только в комнату, в которой состоишь.
+                if !self.subscriptions.contains_key(&sub_key(SUB_ROOM, &c.room_id)) {
+                    return Err(Fail::auth());
+                }
+                if c.data.len() > MEDIA_MAX_BODY {
+                    return Err(Fail(ErrorCode::TooLarge, format!("max {MEDIA_MAX_BODY} bytes")));
+                }
+                self.state.hub.publish_room(&c.room_id, (self.id, c.data.clone()));
+                Ok(R::Done(Done {}))
+            }
 
             // ───── Очереди ─────
             B::QueueNew(c) => {
@@ -536,6 +588,32 @@ impl Conn {
 
         let own = self.state.own_descriptor.lock().unwrap().clone();
         Ok(response::Body::PeerWelcome(PeerWelcome { descriptor: Some(own) }))
+    }
+
+    /// Комната звонка: кадры других участников — сразу в соединение; не успевает — теряются
+    /// (для живого звука и видео задержка хуже потери).
+    fn join_room(&mut self, room_id: Vec<u8>) {
+        let mut rx = self.state.hub.join_room(&room_id);
+        let out = self.out.clone();
+        let me = self.id;
+        let room = room_id.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok((from, data)) if from != me => {
+                        let ev =
+                            Event { body: Some(event::Body::RelayFrame(RelayFrame { room_id: room.clone(), data })) };
+                        match out.try_send((FrameType::Event, ev.encode_to_vec())) {
+                            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                            Err(mpsc::error::TrySendError::Closed(_)) => return,
+                        }
+                    }
+                    Ok(_) | Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => return,
+                }
+            }
+        });
+        self.replace_subscription(SUB_ROOM, &room_id, task);
     }
 
     fn unsubscribe(&mut self, kind: u8, id: &[u8]) {

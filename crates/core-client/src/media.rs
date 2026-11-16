@@ -1,9 +1,10 @@
 //! Вложения: файл шифруется ChaCha20-Poly1305 кусками и кладётся в отдельный журнал на ноде.
 //! Ключи журнала и расшифровки уходят получателям только внутри MLS-сообщения.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
@@ -21,6 +22,41 @@ pub const MAX_FILE: u64 = 100 * 1024 * 1024;
 /// Файлы до этого размера скачиваются сами, как в Telegram.
 pub const AUTO_DOWNLOAD: u64 = 25 * 1024 * 1024;
 
+/// Ход передач по id сообщения (доля 0…1); запись живёт, пока передача идёт.
+static TRANSFERS: LazyLock<Mutex<HashMap<String, f32>>> = LazyLock::new(Default::default);
+
+/// Доля переданного для сообщения или `None`, если сейчас ничего не передаётся.
+pub fn progress(message_id: &str) -> Option<f32> {
+    TRANSFERS.lock().unwrap().get(message_id).copied()
+}
+
+/// Отмечает ход одной передачи; по завершении (в том числе с ошибкой) запись убирается.
+struct Tracker(Option<String>);
+
+impl Tracker {
+    fn new(id: Option<&str>) -> Self {
+        if let Some(id) = id {
+            TRANSFERS.lock().unwrap().insert(id.to_string(), 0.0);
+        }
+        Self(id.map(str::to_string))
+    }
+
+    fn set(&self, done: u64, total: u64) {
+        if let Some(id) = &self.0 {
+            let share = (done as f32 / total.max(1) as f32).min(1.0);
+            TRANSFERS.lock().unwrap().insert(id.clone(), share);
+        }
+    }
+}
+
+impl Drop for Tracker {
+    fn drop(&mut self) {
+        if let Some(id) = &self.0 {
+            TRANSFERS.lock().unwrap().remove(id);
+        }
+    }
+}
+
 fn nonce(index: u32) -> Nonce {
     let mut n = [0u8; 12];
     n[..4].copy_from_slice(&index.to_le_bytes());
@@ -31,7 +67,17 @@ fn io(e: std::io::Error) -> Error {
     Error::Other(format!("file: {e}"))
 }
 
-pub async fn upload(conn: &Arc<NetClient>, node: &str, path: &Path, att: &mut AttachmentRef) -> Result<()> {
+/// `track` — id сообщения, под которым виден ход выгрузки (`progress`).
+pub async fn upload(
+    conn: &Arc<NetClient>,
+    node: &str,
+    path: &Path,
+    att: &mut AttachmentRef,
+    track: Option<&str>,
+) -> Result<()> {
+    let tracker = Tracker::new(track);
+    let total = std::fs::metadata(path).map(|m| m.len().div_ceil(CHUNK as u64).max(1)).unwrap_or(1);
+    let mut done = 0u64;
     let key: [u8; 32] = random_bytes();
     let (write, read) = (Ed25519Key::generate(), Ed25519Key::generate());
     let log_id = random_bytes::<32>().to_vec();
@@ -71,6 +117,8 @@ pub async fn upload(conn: &Arc<NetClient>, node: &str, path: &Path, att: &mut At
 
         if tasks.len() >= IN_FLIGHT {
             tasks.join_next().await.unwrap().map_err(|e| Error::Other(e.to_string()))??;
+            done += 1;
+            tracker.set(done, total);
         }
         let (conn, write, log_id) = (conn.clone(), write.clone(), log_id.clone());
         tasks.spawn(async move {
@@ -86,6 +134,8 @@ pub async fn upload(conn: &Arc<NetClient>, node: &str, path: &Path, att: &mut At
     }
     while let Some(r) = tasks.join_next().await {
         r.map_err(|e| Error::Other(e.to_string()))??;
+        done += 1;
+        tracker.set(done, total);
     }
 
     att.node = node.to_string();
@@ -96,7 +146,9 @@ pub async fn upload(conn: &Arc<NetClient>, node: &str, path: &Path, att: &mut At
     Ok(())
 }
 
-pub async fn download(conn: &Arc<NetClient>, att: &AttachmentRef, dest: &Path) -> Result<()> {
+/// `track` — id сообщения, под которым виден ход загрузки (`progress`).
+pub async fn download(conn: &Arc<NetClient>, att: &AttachmentRef, dest: &Path, track: Option<&str>) -> Result<()> {
+    let tracker = Tracker::new(track);
     let key: [u8; 32] = att.key.as_slice().try_into().map_err(|_| Error::Other("bad attachment key".into()))?;
     let read = Arc::new(Ed25519Key::from_bytes(
         att.rk.as_slice().try_into().map_err(|_| Error::Other("bad attachment key".into()))?,
@@ -136,6 +188,7 @@ pub async fn download(conn: &Arc<NetClient>, att: &AttachmentRef, dest: &Path) -
                 if slot.is_none() {
                     *slot = Some(plain);
                     got += 1;
+                    tracker.set(got as u64, parts.len() as u64);
                 }
             }
         }

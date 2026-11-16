@@ -8,7 +8,8 @@ use core_net::{Client, NetError, NodeAddr};
 use core_node::{Config, Node, NodeIdentity, Store};
 use core_proto::msg::{
     event, gossip, request, response, ErrorCode, Event, Gossip, LogAppend, LogNew, LogWatch, NetNode, NetSnapshot,
-    NodeDescriptor, PeerHello, PresencePut, PresenceUpdate, PresenceWatch, Unsubscribe,
+    NodeDescriptor, PeerHello, PresencePut, PresenceUpdate, PresenceWatch, RelayJoin, RelayLeave, RelaySend,
+    Unsubscribe,
 };
 use tokio::sync::mpsc;
 
@@ -219,4 +220,47 @@ async fn unsubscribe_stops_events() {
     c.request(request::Body::Unsubscribe(Unsubscribe { id: log_id.clone() }), None).await.unwrap();
     c.request(append(b"2"), Some(&write)).await.unwrap();
     assert!(tokio::time::timeout(Duration::from_millis(300), events.recv()).await.is_err(), "event after unsubscribe");
+}
+
+/// Звонки: медиа-соединения входят в комнату, кадр уходит всем, кроме отправителя; без входа слать нельзя;
+/// обычное соединение команды комнат не принимает, медиа — обычные команды.
+#[tokio::test]
+async fn call_relay_rooms() {
+    let node = start(vec![]).await;
+    let room = random_bytes::<16>().to_vec();
+    let join = |room: &Vec<u8>| request::Body::RelayJoin(RelayJoin { room_id: room.clone() });
+    let send = |room: &Vec<u8>, data: &[u8]| {
+        request::Body::RelaySend(RelaySend { room_id: room.clone(), data: data.to_vec() })
+    };
+
+    let (a, mut ea) = Client::connect_media(&node.addr).await.unwrap();
+    let (b, mut eb) = Client::connect_media(&node.addr).await.unwrap();
+    let (c, mut ec) = Client::connect_media(&node.addr).await.unwrap();
+    a.request(join(&room), None).await.unwrap();
+    b.request(join(&room), None).await.unwrap();
+    c.request(join(&room), None).await.unwrap();
+
+    a.send_oneway(send(&room, b"voice-1")).await.unwrap();
+    for events in [&mut eb, &mut ec] {
+        let ev = tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
+        let Some(event::Body::RelayFrame(f)) = ev.body else { panic!("expected relay frame") };
+        assert_eq!((f.room_id, f.data), (room.clone(), b"voice-1".to_vec()));
+    }
+    // Себе кадр не возвращается.
+    assert!(tokio::time::timeout(Duration::from_millis(300), ea.recv()).await.is_err());
+
+    // Вышел — больше не получает и не может слать.
+    c.request(request::Body::RelayLeave(RelayLeave { room_id: room.clone() }), None).await.unwrap();
+    assert_eq!(code(c.request(send(&room, b"x"), None).await.unwrap_err()), ErrorCode::Auth);
+    b.send_oneway(send(&room, b"voice-2")).await.unwrap();
+    let ev = tokio::time::timeout(Duration::from_secs(5), ea.recv()).await.unwrap().unwrap();
+    assert!(matches!(ev.body, Some(event::Body::RelayFrame(f)) if f.data == b"voice-2"));
+    assert!(tokio::time::timeout(Duration::from_millis(300), ec.recv()).await.is_err());
+
+    // Кадр больше медиа-кадра не пролезет; обычное соединение комнат не знает, медиа — обычных команд.
+    assert!(a.request(send(&room, &vec![0; 1300]), None).await.is_err());
+    let (normal, _en) = Client::connect(&node.addr).await.unwrap();
+    assert_eq!(code(normal.request(join(&room), None).await.unwrap_err()), ErrorCode::BadRequest);
+    let presence = request::Body::PresenceWatch(PresenceWatch { presence_ids: vec![] });
+    assert_eq!(code(a.request(presence, None).await.unwrap_err()), ErrorCode::BadRequest);
 }

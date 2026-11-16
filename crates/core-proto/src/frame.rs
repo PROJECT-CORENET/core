@@ -13,6 +13,10 @@ use crate::PROTOCOL_VERSION;
 pub const FRAME_SIZE: usize = 16 * 1024;
 pub const FRAME_HEADER: usize = 4;
 pub const MAX_BODY: usize = FRAME_SIZE - FRAME_HEADER;
+/// Медиа-соединение (звонки): кадры мельче, но тоже одинакового размера — по трафику
+/// не отличить речь от тишины и ключевой кадр видео от обычного.
+pub const MEDIA_FRAME_SIZE: usize = 1200;
+pub const MEDIA_MAX_BODY: usize = MEDIA_FRAME_SIZE - FRAME_HEADER;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,10 +54,19 @@ pub enum FrameError {
 }
 
 pub fn encode(ty: FrameType, body: &[u8]) -> Result<Vec<u8>, FrameError> {
-    if body.len() > MAX_BODY {
+    encode_sized(ty, body, FRAME_SIZE)
+}
+
+pub fn decode(frame: &[u8]) -> Result<(FrameType, &[u8]), FrameError> {
+    decode_sized(frame, FRAME_SIZE)
+}
+
+/// Кадр заданного размера (`FRAME_SIZE` или `MEDIA_FRAME_SIZE`).
+pub fn encode_sized(ty: FrameType, body: &[u8], size: usize) -> Result<Vec<u8>, FrameError> {
+    if body.len() > size - FRAME_HEADER {
         return Err(FrameError::TooLarge(body.len()));
     }
-    let mut frame = vec![0u8; FRAME_SIZE];
+    let mut frame = vec![0u8; size];
     frame[0] = PROTOCOL_VERSION;
     frame[1] = ty as u8;
     frame[2..4].copy_from_slice(&(body.len() as u16).to_be_bytes());
@@ -61,8 +74,8 @@ pub fn encode(ty: FrameType, body: &[u8]) -> Result<Vec<u8>, FrameError> {
     Ok(frame)
 }
 
-pub fn decode(frame: &[u8]) -> Result<(FrameType, &[u8]), FrameError> {
-    if frame.len() != FRAME_SIZE {
+pub fn decode_sized(frame: &[u8], size: usize) -> Result<(FrameType, &[u8]), FrameError> {
+    if frame.len() != size {
         return Err(FrameError::BadSize(frame.len()));
     }
     if frame[0] != PROTOCOL_VERSION {
@@ -70,7 +83,7 @@ pub fn decode(frame: &[u8]) -> Result<(FrameType, &[u8]), FrameError> {
     }
     let ty = FrameType::try_from(frame[1])?;
     let len = u16::from_be_bytes([frame[2], frame[3]]) as usize;
-    if len > MAX_BODY {
+    if len > size - FRAME_HEADER {
         return Err(FrameError::BadLength(len));
     }
     Ok((ty, &frame[FRAME_HEADER..FRAME_HEADER + len]))
@@ -96,6 +109,15 @@ mod tests {
         let max = vec![7u8; MAX_BODY];
         let frame = encode(FrameType::Request, &max).unwrap();
         assert_eq!(decode(&frame).unwrap().1, &max[..]);
+    }
+
+    #[test]
+    fn media_frames() {
+        let frame = encode_sized(FrameType::Event, b"voice", MEDIA_FRAME_SIZE).unwrap();
+        assert_eq!(frame.len(), MEDIA_FRAME_SIZE);
+        assert_eq!(decode_sized(&frame, MEDIA_FRAME_SIZE).unwrap().1, b"voice");
+        assert!(encode_sized(FrameType::Event, &vec![0; MEDIA_MAX_BODY + 1], MEDIA_FRAME_SIZE).is_err());
+        assert_eq!(decode(&frame), Err(FrameError::BadSize(MEDIA_FRAME_SIZE)));
     }
 
     #[test]
