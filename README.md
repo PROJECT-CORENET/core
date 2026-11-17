@@ -1,7 +1,5 @@
 # CORE — Rust-ядро и нода
 
-Архитектура — [`../АРХИТЕКТУРА.md`](../АРХИТЕКТУРА.md), прогресс — [`../ПРОГРЕСС.md`](../ПРОГРЕСС.md).
-
 Нода CORE — это сервер-ретранслятор децентрализованной сети. Она:
 
 - хранит **зашифрованные** сообщения до доставки (очереди и журналы чатов) — содержимого не видит;
@@ -71,6 +69,49 @@ cargo run -p core-cli -- net  core://<ключ>@127.0.0.1:7443   # сеть гл
 
 ## Развёртывание на сервере (Docker)
 
+### Самый быстрый запуск: готовый образ + соседи из общего списка
+
+Без клонирования репозитория и сборки: создайте на сервере папку с одним файлом `docker-compose.yml`,
+поменяйте `CORE_PUBLIC_HOST` на IP (или домен) сервера и запустите `docker compose up -d`.
+`GIT_NODES=1` — нода сама скачает список нод сети, подключится к ближайшим по задержке
+и будет пересматривать соседей (см. [Bootstrap](#bootstrap)); вручную `CORE_BOOTSTRAP` задавать не нужно.
+
+```yaml
+# docker-compose.yml — нода CORE
+services:
+  node:
+    image: ghcr.io/project-corenet/core-node:latest
+    container_name: core-node
+    restart: unless-stopped
+    ports:
+      - "7443:7443"                     # снаружи:внутри — откройте этот TCP-порт в фаерволе
+    environment:
+      CORE_PUBLIC_HOST: "203.0.113.10:7443"   # ← публичный IP или домен сервера + внешний порт
+      GIT_NODES: "1"                    # соседи из общего списка сети, ближайшие по задержке
+      CORE_NAME: "My-Node"              # имя на карте сети (необязательно)
+      CORE_REGION: "NL"                 # код страны на карте (необязательно)
+      RUST_LOG: info
+    volumes:
+      - core-node-data:/data            # ключи ноды: адрес не меняется между перезапусками
+    ulimits:
+      nofile: { soft: 65536, hard: 65536 }
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  core-node-data:
+```
+
+```sh
+docker compose up -d
+docker compose exec node core-node info     # адрес вашей ноды core://…
+docker compose logs -f node | grep -E "node list|nearest|peer connected"   # кого нода выбрала в соседи
+```
+
+В логах через несколько секунд после старта: `📥 node list …: N nodes`, `📶 nearest nodes: …`
+и `🔗 peer connected (outbound)`. Обновление — `docker compose pull && docker compose up -d`.
+
 ### Требования
 
 - Linux-сервер с публичным IP (подойдёт VPS за 3–5 $/мес: 1 vCPU, 512 МБ RAM, 10 ГБ диска).
@@ -81,7 +122,7 @@ cargo run -p core-cli -- net  core://<ключ>@127.0.0.1:7443   # сеть гл
 
 ```sh
 # 1. Код
-git clone <репозиторий> core && cd core/CORE
+git clone https://github.com/PROJECT-CORENET/core && cd core
 
 # 2. Настройки
 cp .env.example .env
@@ -349,6 +390,7 @@ journalctl -u core-node -f
 | `name` | `CORE_NAME` / `--name` | `""` | Имя на карте сети (до 64 байт) |
 | `region` | `CORE_REGION` / `--region` | `""` | Код страны на карте сети |
 | `bootstrap` | `CORE_BOOTSTRAP` / `--bootstrap` | `[]` | Адреса `core://…` для входа в сеть |
+| `git_nodes` | `GIT_NODES` / `--git-nodes` | — | `1` — соседи из общего списка сети (ближайшие по задержке), или своя ссылка на `nodes.json` |
 | `max_peers` | — | `8` | Целевое число соседей (исходящих — половина) |
 | `gossip_interval_secs` | — | `60` | Период публикации статистики |
 | `peer_check_interval_secs` | — | `10` | Как часто добирать соседей |

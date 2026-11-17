@@ -746,7 +746,29 @@ impl Store {
     // ── сообщения ──
 
     pub fn insert_message(&self, m: &MessageRow) -> Result<bool> {
+        self.with(|c| Self::insert_message_in(c, m))
+    }
+
+    /// Новое сообщение и время/непрочитанные чата — одной операцией под замком базы:
+    /// иначе между записями читатель видел сообщение без счётчика непрочитанных.
+    /// Чат трогается, только если сообщение действительно новое.
+    pub fn insert_message_touch(&self, m: &MessageRow, ts: u64, unread_delta: u32) -> Result<bool> {
         self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            let inserted = Self::insert_message_in(&tx, m)?;
+            if inserted {
+                tx.execute(
+                    "UPDATE chats SET last_ms = MAX(last_ms, ?), unread = unread + ? WHERE id = ?",
+                    params![ts as i64, unread_delta, m.chat_id],
+                )?;
+            }
+            tx.commit()?;
+            Ok(inserted)
+        })
+    }
+
+    fn insert_message_in(c: &Connection, m: &MessageRow) -> Result<bool> {
+        {
             let attachment = m.attachment.as_ref().map(|a| serde_json::to_string(a).unwrap());
             let link = m.link.as_ref().map(|l| serde_json::to_string(l).unwrap());
             let n = c.execute(
@@ -768,7 +790,7 @@ impl Store {
                 ],
             )?;
             Ok(n > 0)
-        })
+        }
     }
 
     pub fn message(&self, id: &str) -> Result<Option<MessageRow>> {

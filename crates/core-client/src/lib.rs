@@ -1782,7 +1782,7 @@ impl Inner {
                 let mine = sender == self.me;
                 let settings = self.media_settings();
                 let auto = att.as_ref().is_some_and(|a| settings.auto_download(a));
-                let inserted = self.store.insert_message(&MessageRow {
+                let row = MessageRow {
                     id: id.clone(),
                     chat_id: chat.id.clone(),
                     sender_id: sender.into(),
@@ -1796,9 +1796,13 @@ impl Inner {
                     link: link.and_then(|l| l.sanitized()),
                     fwd: fwd.map(|f| f.chars().take(64).collect()),
                     fwd_id: fwd_id.filter(|k| Forward::valid_id(k)),
-                })?;
+                };
+                let inserted = if mine {
+                    self.store.insert_message_touch(&row, ts, 0)?
+                } else {
+                    self.store.insert_message_touch(&row, ts.max(now_ms().min(ts + 60_000)), 1)?
+                };
                 if inserted && mine {
-                    self.store.touch_chat(&chat.id, ts, 0)?;
                     if auto {
                         let inner = self.clone();
                         self.rt.spawn(async move {
@@ -1808,7 +1812,6 @@ impl Inner {
                         });
                     }
                 } else if inserted {
-                    self.store.touch_chat(&chat.id, ts.max(now_ms().min(ts + 60_000)), 1)?;
                     self.schedule_delivery_receipt(&chat.id);
                     // Как в Telegram: новое сообщение достаёт чат из архива, если он не заглушён.
                     if !chat.muted {
