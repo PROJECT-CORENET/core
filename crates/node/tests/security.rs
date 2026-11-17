@@ -1,15 +1,19 @@
 //! Тесты безопасности ноды: мусор и обрывы на входе, «тихие» соединения, лимит соединений,
-//! перебор идентификаторов, чужие ключи. Нода должна отказывать, не падать и продолжать обслуживать остальных.
+//! перебор идентификаторов, чужие ключи, подмена подписанных команд, мусор внутри шифрованного канала, лимиты.
+//! Нода должна отказывать, не падать и продолжать обслуживать остальных.
 
 use std::time::Duration;
 
 use core_crypto::{random_bytes, Ed25519Key};
 use core_net::{Client, NetError, NodeAddr};
 use core_node::{Config, Node, NodeIdentity, Store};
+use core_proto::frame::FrameType;
 use core_proto::msg::{
-    request, response, ErrorCode, LogAppend, LogCommit, LogNew, LogRead, Ping, QueueCreated, QueueDel, QueueNew,
-    QueueSecure, QueueSub,
+    event, request, response, ErrorCode, LogAppend, LogCommit, LogNew, LogRead, Ping, PresenceWatch, QueueAck,
+    QueueCreated, QueueDel, QueueNew, QueueSecure, QueueSend, QueueSub, RelayJoin, Request, MAX_PRESENCE_WATCH,
+    MAX_ROOMS_PER_CONN, PRESENCE_ID_LEN, ROOM_ID_LEN,
 };
+use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -208,12 +212,8 @@ async fn stranger_cannot_take_over_queue_or_log() {
     assert_eq!(code(c.request(read_req.clone(), Some(&thief)).await.unwrap_err()), ErrorCode::Auth);
     c.request(read_req, Some(&read)).await.unwrap();
 
-    let commit = request::Body::LogCommit(LogCommit {
-        log_id: log_id.clone(),
-        expected_offset: 1,
-        blob: b"evil".to_vec(),
-    });
-    assert!(c.request(commit, Some(&thief)).await.is_err(), "коммит в чужой журнал");
+    let commit = request::Body::LogCommit(LogCommit { log_id: log_id.clone(), epoch: 1, blob: b"evil".to_vec() });
+    assert_eq!(code(c.request(commit, Some(&thief)).await.unwrap_err()), ErrorCode::Auth, "коммит в чужой журнал");
 
     // Пересоздать чужой журнал со своими ключами — тоже нельзя.
     let hijack = request::Body::LogNew(LogNew {
@@ -222,4 +222,149 @@ async fn stranger_cannot_take_over_queue_or_log() {
         read_pk: thief.public_key().to_vec(),
     });
     assert_eq!(code(c.request(hijack, None).await.unwrap_err()), ErrorCode::AlreadyExists);
+}
+
+#[tokio::test]
+async fn signed_command_cannot_be_altered() {
+    // Подпись покрывает всю команду: поменять тело или corr_id под чужой подписью нельзя.
+    let addr = start(Config::default()).await;
+    let (c, _ev) = Client::connect(&addr).await.unwrap();
+    let write = Ed25519Key::generate();
+    let log_id = random_bytes::<32>().to_vec();
+    c.request(
+        request::Body::LogNew(LogNew {
+            log_id: log_id.clone(),
+            write_pk: write.public_key().to_vec(),
+            read_pk: Ed25519Key::generate().public_key().to_vec(),
+        }),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let append =
+        |blob: &[u8]| Some(request::Body::LogAppend(LogAppend { log_id: log_id.clone(), blob: blob.to_vec() }));
+    let mut signed = Request { corr_id: 1000, auth_sig: vec![], body: append(b"honest") };
+    signed.auth_sig = write.sign(&signed.signing_bytes(c.session_hash())).to_vec();
+
+    let forged_body = Request { body: append(b"forged"), ..signed.clone() };
+    assert_eq!(code(c.send_request(forged_body).await.unwrap_err()), ErrorCode::Auth);
+    let forged_corr = Request { corr_id: 1001, ..signed.clone() };
+    assert_eq!(code(c.send_request(forged_corr).await.unwrap_err()), ErrorCode::Auth);
+    let mut broken_sig = signed.clone();
+    broken_sig.auth_sig[0] ^= 1;
+    assert_eq!(code(c.send_request(broken_sig).await.unwrap_err()), ErrorCode::Auth);
+    let short_sig = Request { auth_sig: signed.auth_sig[..10].to_vec(), ..signed.clone() };
+    assert_eq!(code(c.send_request(short_sig).await.unwrap_err()), ErrorCode::Auth);
+
+    // Подлинная команда проходит.
+    c.send_request(signed).await.unwrap();
+}
+
+#[tokio::test]
+async fn garbage_inside_encrypted_channel_closes_only_that_connection() {
+    let addr = start(Config::default()).await;
+    let (bystander, _ev) = Client::connect(&addr).await.unwrap();
+
+    // Рукопожатие честное, а дальше — не протобаф, чужой тип кадра, ответ вместо запроса.
+    for (ty, body) in [
+        (FrameType::Request, random_bytes::<200>().to_vec()),
+        (FrameType::Request, vec![0xFF; 64]),
+        (FrameType::Response, Request { corr_id: 1, auth_sig: vec![], body: None }.encode_to_vec()),
+        (FrameType::Event, vec![]),
+    ] {
+        let mut s = core_net::connect(&addr).await.unwrap();
+        s.writer.send(ty, &body).await.unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if s.reader.recv().await.is_err() {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "нода не закрыла соединение с мусорным кадром {ty:?}");
+    }
+
+    // Остальные соединения не задеты.
+    assert!(matches!(bystander.request(request::Body::Ping(Ping {}), None).await.unwrap(), response::Body::Pong(_)));
+    assert_alive(&addr).await;
+}
+
+#[tokio::test]
+async fn stranger_cannot_ack_or_delete_foreign_messages() {
+    // Зная recipient_id и msg_id, чужой не может ни подтвердить (стереть) сообщение, ни удалить очередь.
+    let addr = start(Config::default()).await;
+    let (c, mut events) = Client::connect(&addr).await.unwrap();
+    let owner = Ed25519Key::generate();
+    let stranger = Ed25519Key::generate();
+    let q = new_queue(&c, &owner).await;
+    c.request(request::Body::QueueSend(QueueSend { sender_id: q.sender_id.clone(), body: b"secret".to_vec() }), None)
+        .await
+        .unwrap();
+    c.request(request::Body::QueueSub(QueueSub { recipient_id: q.recipient_id.clone() }), Some(&owner)).await.unwrap();
+    let ev = tokio::time::timeout(Duration::from_secs(5), events.recv()).await.unwrap().unwrap();
+    let Some(event::Body::QueueMessage(m)) = ev.body else {
+        panic!("ожидалось сообщение очереди")
+    };
+
+    let ack = request::Body::QueueAck(QueueAck { recipient_id: q.recipient_id.clone(), msg_id: m.msg_id.clone() });
+    assert_eq!(code(c.request(ack.clone(), Some(&stranger)).await.unwrap_err()), ErrorCode::Auth);
+    assert_eq!(code(c.request(ack.clone(), None).await.unwrap_err()), ErrorCode::Auth);
+    let del = request::Body::QueueDel(QueueDel { recipient_id: q.recipient_id.clone() });
+    assert_eq!(code(c.request(del, Some(&stranger)).await.unwrap_err()), ErrorCode::Auth);
+
+    // Сообщение на месте: владелец подтверждает его сам.
+    c.request(ack, Some(&owner)).await.unwrap();
+}
+
+#[tokio::test]
+async fn per_connection_limits() {
+    let addr = start(Config::default()).await;
+
+    // Комнаты звонков: не больше MAX_ROOMS_PER_CONN на соединение, повторный вход в свою — можно.
+    let (media, _em) = Client::connect_media(&addr).await.unwrap();
+    let join = |room: &[u8]| request::Body::RelayJoin(RelayJoin { room_id: room.to_vec() });
+    let rooms: Vec<_> = (0..MAX_ROOMS_PER_CONN).map(|_| random_bytes::<ROOM_ID_LEN>()).collect();
+    for room in &rooms {
+        media.request(join(room), None).await.unwrap();
+    }
+    let extra = random_bytes::<ROOM_ID_LEN>();
+    assert_eq!(code(media.request(join(&extra), None).await.unwrap_err()), ErrorCode::QuotaExceeded);
+    media.request(join(&rooms[0]), None).await.unwrap();
+    assert_eq!(code(media.request(join(&[1; 3]), None).await.unwrap_err()), ErrorCode::BadRequest);
+
+    // Presence: за раз не больше MAX_PRESENCE_WATCH id, и все — правильной длины.
+    let (c, _ev) = Client::connect(&addr).await.unwrap();
+    let watch = |ids: Vec<Vec<u8>>| request::Body::PresenceWatch(PresenceWatch { presence_ids: ids });
+    let too_many = (0..=MAX_PRESENCE_WATCH).map(|_| random_bytes::<PRESENCE_ID_LEN>().to_vec()).collect();
+    assert_eq!(code(c.request(watch(too_many), None).await.unwrap_err()), ErrorCode::BadRequest);
+    let bad_len = vec![random_bytes::<PRESENCE_ID_LEN>().to_vec(), vec![0; PRESENCE_ID_LEN + 1]];
+    assert_eq!(code(c.request(watch(bad_len), None).await.unwrap_err()), ErrorCode::BadRequest);
+
+    // Неверная длина ключей и id журнала — отказ до записи в базу.
+    let pk = Ed25519Key::generate().public_key().to_vec();
+    for (log_id, write_pk) in [(vec![0; 31], pk.clone()), (vec![0; 32], vec![0; 31]), (vec![], pk.clone())] {
+        let req = request::Body::LogNew(LogNew { log_id, write_pk, read_pk: pk.clone() });
+        assert_eq!(code(c.request(req, None).await.unwrap_err()), ErrorCode::BadRequest);
+    }
+}
+
+#[tokio::test]
+async fn request_flood_does_not_block_other_clients() {
+    let addr = start(Config::default()).await;
+    let (flooder, _ef) = Client::connect(&addr).await.unwrap();
+    let flooder = std::sync::Arc::new(flooder);
+    let mut tasks = vec![];
+    for _ in 0..2000 {
+        let f = flooder.clone();
+        tasks.push(tokio::spawn(async move {
+            let _ = f.request(request::Body::Ping(Ping {}), None).await;
+        }));
+    }
+    // Пока один клиент заваливает ноду запросами, другой обслуживается быстро.
+    tokio::time::timeout(Duration::from_secs(5), assert_alive(&addr)).await.expect("нода не отвечает другим");
+    for t in tasks {
+        t.await.unwrap();
+    }
 }
