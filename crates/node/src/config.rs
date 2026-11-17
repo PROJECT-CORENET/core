@@ -20,6 +20,9 @@ pub struct Config {
 
     /// Адреса `core://…` нод, с которых начинается знакомство с сетью (§20.2).
     pub bootstrap: Vec<String>,
+    /// Общий список нод (JSON с GitHub Pages): нода берёт из него ближайших как bootstrap и сама
+    /// время от времени перебирает соседей по задержке. `None` — только `bootstrap`.
+    pub git_nodes: Option<String>,
     /// Желаемое число соседей; исходящих соединений — половина.
     pub max_peers: usize,
     /// Как часто публиковать свой дескриптор и статистику (§16.2: 60 с).
@@ -49,6 +52,7 @@ impl Default for Config {
             name: String::new(),
             region: String::new(),
             bootstrap: vec![],
+            git_nodes: None,
             max_peers: 8,
             gossip_interval_secs: 60,
             peer_check_interval_secs: 10,

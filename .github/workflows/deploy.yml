@@ -83,12 +83,15 @@ jobs:
           [ -n "$addr" ] || { echo "❌ no address in core-node info"; exit 1; }
           mkdir -p out
           echo "$addr" > "out/${{ matrix.name }}.addr"
+          echo "${{ matrix.region }}" > "out/${{ matrix.name }}.region"
           echo "🆔 ${{ matrix.name }} → $addr"
 
       - uses: actions/upload-artifact@v4
         with:
           name: addr-${{ matrix.name }}
-          path: out/${{ matrix.name }}.addr
+          path: |
+            out/${{ matrix.name }}.addr
+            out/${{ matrix.name }}.region
           retention-days: 7
 
   # 2. Запустить ноды: bootstrap — все остальные ноды сети.
@@ -138,6 +141,7 @@ jobs:
             -e CORE_NAME="${{ matrix.name }}" \
             -e CORE_REGION="${{ matrix.region }}" \
             -e CORE_BOOTSTRAP="${{ steps.boot.outputs.list }}" \
+            -e GIT_NODES="${{ vars.GIT_NODES }}" \
             "$IMAGE:${{ steps.tag.outputs.tag }}" run
           echo "🚀 ${{ matrix.name }} started on :$port"
 
@@ -190,6 +194,7 @@ jobs:
             if out=$(docker run --rm --entrypoint core-cli "$IMAGE:${{ steps.tag.outputs.tag }}" ping --count 3 "$addr" 2>&1); then
               echo "✅ $name: $out"
               result="✅"
+              touch "addrs/$name.online"
             else
               echo "❌ $name unreachable: $out"
               result="❌ недоступна"
@@ -209,7 +214,10 @@ jobs:
             for f in addrs/*.addr; do
               [ $first = 1 ] || echo ","
               first=0
-              printf '  {"name": "%s", "address": "%s"}' "$(basename "$f" .addr)" "$(cat "$f")"
+              name=$(basename "$f" .addr)
+              region=$(cat "addrs/$name.region" 2>/dev/null || true)
+              online=false; [ -f "addrs/$name.online" ] && online=true
+              printf '  {"name": "%s", "region": "%s", "address": "%s", "online": %s}' "$name" "$region" "$(cat "$f")" "$online"
             done
             echo
             echo "]"
@@ -217,7 +225,7 @@ jobs:
           cat out/nodes.json
           {
             echo
-            echo "Список для приложения (\`PROJECT-CORENET/nodes/nodes.json\`):"
+            echo "Список для приложения и нод с \`GIT_NODES\` (публикуется на GitHub Pages):"
             echo '```json'
             cat out/nodes.json
             echo '```'
@@ -228,3 +236,39 @@ jobs:
         with:
           name: nodes-json
           path: out/nodes.json
+
+  # 4. Страница со списком нод на GitHub Pages + nodes.json рядом: из него приложение выбирает
+  #    ближайшую ноду, а ноды с GIT_NODES=1 — соседей. Один раз: Settings → Pages → Source: GitHub Actions.
+  pages:
+    needs: verify
+    if: always() && needs.verify.result != 'skipped' && needs.verify.result != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nodes-json
+          path: site
+
+      - name: Build page
+        run: |
+          python3 scripts/nodes-page.py site/nodes.json site/index.html "${{ github.sha }}"
+          touch site/.nojekyll
+          echo "📄 $(grep -c '"address"' site/nodes.json) nodes on the page"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

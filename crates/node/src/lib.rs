@@ -6,6 +6,7 @@
 //! - **presence** — статус «в сети» с heartbeat и TTL (§15).
 
 pub mod config;
+pub mod discovery;
 pub mod identity;
 pub mod server;
 pub mod store;

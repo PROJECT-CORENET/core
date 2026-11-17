@@ -33,6 +33,11 @@ struct Cli {
     #[arg(long, env = "CORE_BOOTSTRAP", value_delimiter = ',', global = true)]
     bootstrap: Option<Vec<String>>,
 
+    /// Брать соседей из общего списка нод: URL списка или `1` / `true` — список сети CORE по умолчанию.
+    /// Нода сама выберет ближайшие по задержке и будет пересматривать их.
+    #[arg(long, env = "GIT_NODES", global = true)]
+    git_nodes: Option<String>,
+
     /// Имя ноды для карты сети.
     #[arg(long, env = "CORE_NAME", global = true)]
     name: Option<String>,
@@ -83,9 +88,10 @@ async fn main() -> anyhow::Result<()> {
             }
             print_info(&identity, &node.address().to_string());
             info!(
-                "🚀 node started: listen={} bootstrap={} name={:?} region={:?}",
+                "🚀 node started: listen={} bootstrap={} git_nodes={:?} name={:?} region={:?}",
                 node.local_addr()?,
                 config.bootstrap.len(),
+                config.git_nodes,
                 config.name,
                 config.region
             );
@@ -112,6 +118,9 @@ fn prepare(cli: &Cli) -> anyhow::Result<(Config, NodeIdentity)> {
     }
     if let Some(v) = &cli.bootstrap {
         config.bootstrap = v.clone();
+    }
+    if let Some(v) = &cli.git_nodes {
+        config.git_nodes = core_node::discovery::list_url(v);
     }
     if let Some(v) = &cli.name {
         config.name = v.clone();

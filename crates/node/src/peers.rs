@@ -48,6 +48,8 @@ pub struct Peers {
     backoff: Mutex<HashMap<[u8; 32], (u32, Instant)>>,
     /// Набор соседей изменился — пора опубликовать свежую статистику.
     changed: Notify,
+    /// Исходящие соединения, которые можно закрыть по просьбе подбора соседей (нашлась нода ближе).
+    kicks: Mutex<HashMap<[u8; 32], Arc<Notify>>>,
 }
 
 impl Peers {
@@ -108,6 +110,18 @@ impl Peers {
 
     fn dialing_count(&self) -> usize {
         self.dialing.lock().unwrap().len()
+    }
+
+    /// Ключи исходящих соседей (подключённых или подключающихся).
+    pub(crate) fn outbound_keys(&self) -> HashSet<[u8; 32]> {
+        self.dialing.lock().unwrap().clone()
+    }
+
+    /// Закрыть исходящее соединение с нодой (его место займёт более близкая).
+    pub(crate) fn kick(&self, key: [u8; 32]) {
+        if let Some(n) = self.kicks.lock().unwrap().get(&key) {
+            n.notify_one();
+        }
     }
 }
 
@@ -281,6 +295,20 @@ pub(crate) async fn dialer_loop(state: Arc<State>) {
         }
         let mut candidates = collect_candidates(&state, &bootstrap);
         candidates.shuffle(&mut rand::thread_rng());
+        // С GIT_NODES — сначала ближайшие по измеренной задержке, остальные — вперемешку после них.
+        let ranked = state.ranked.lock().unwrap().clone();
+        if !ranked.is_empty() {
+            for r in &ranked {
+                if !candidates.iter().any(|c| c.key == r.key)
+                    && r.key != state.identity.noise.public
+                    && !state.peers.outbound_keys().contains(&r.key)
+                {
+                    candidates.push(Target { key: r.key, hosts: r.hosts.clone() });
+                }
+            }
+            let order = |key: &[u8; 32]| ranked.iter().position(|r| r.key == *key).unwrap_or(usize::MAX);
+            candidates.sort_by_key(|c| order(&c.key));
+        }
         let mut started = 0;
         for target in candidates {
             if started == need {
@@ -359,6 +387,8 @@ async fn run_outbound(state: &Arc<State>, target: &Target) -> Result<(), NetErro
 
     let (tx, mut rx) = mpsc::channel(LINK_QUEUE);
     let link = state.peers.register(node_id, tx.clone());
+    let kick = Arc::new(Notify::new());
+    state.peers.kicks.lock().unwrap().insert(target.key, kick.clone());
     initial_sync(state, &tx);
     info!("🔗 peer connected (outbound) node={}", short_id(&node_id));
 
@@ -381,9 +411,11 @@ async fn run_outbound(state: &Arc<State>, target: &Target) -> Result<(), NetErro
                 if let Err(e) = client.request(request::Body::Ping(Ping {}), None).await { break e }
             }
             _ = &mut inbound => break NetError::Closed,
+            _ = kick.notified() => break NetError::Protocol("replaced by a nearer neighbour".into()),
         }
     };
     inbound.abort();
+    state.peers.kicks.lock().unwrap().remove(&target.key);
     state.peers.unregister(link);
     info!("💔 peer disconnected (outbound) node={} reason={reason}", short_id(&node_id));
     Ok(())

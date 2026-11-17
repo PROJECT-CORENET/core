@@ -59,6 +59,8 @@ pub(crate) struct State {
     pub clients: AtomicUsize,
     pub connections: AtomicUsize,
     pub started: Instant,
+    /// Ноды по задержке (только с `git_nodes`): дозвон начинается с ближайших.
+    pub ranked: Mutex<Vec<crate::discovery::Ranked>>,
 }
 
 pub struct Node {
@@ -93,6 +95,7 @@ impl Node {
             clients: AtomicUsize::new(0),
             connections: AtomicUsize::new(0),
             started: Instant::now(),
+            ranked: Mutex::default(),
         };
         Ok(Self { listener, state: Arc::new(state) })
     }
@@ -113,6 +116,7 @@ impl Node {
         tokio::spawn(presence_loop(state.clone()));
         tokio::spawn(peers::publisher_loop(state.clone()));
         tokio::spawn(peers::dialer_loop(state.clone()));
+        tokio::spawn(crate::discovery::discovery_loop(state.clone()));
         let limit = Arc::new(Semaphore::new(state.config.max_connections));
 
         loop {

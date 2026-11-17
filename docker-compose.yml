@@ -24,6 +24,7 @@ services:
       RUST_LOG: ${RUST_LOG:-info}
       CORE_PUBLIC_HOST: ${CORE_PUBLIC_HOST:-127.0.0.1:7443}
       CORE_BOOTSTRAP: ${CORE_BOOTSTRAP:-}
+      GIT_NODES: ${GIT_NODES:-}
       CORE_NAME: ${CORE_NAME:-}
       CORE_REGION: ${CORE_REGION:-}
     ports:
