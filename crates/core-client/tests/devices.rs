@@ -45,7 +45,9 @@ async fn second_device_full_sync() {
     let (p_chat, link) = phone.create_chat(None).await.unwrap();
     let b_chat = bob.accept_invite(&link).await.unwrap();
     eventually("bob joins", || bob.chat(&b_chat).unwrap().state == ChatState::Active).await;
-    bob.send_text(&b_chat, "до связывания", None, None).await.unwrap();
+    let history_id = bob.send_text(&b_chat, "original history", None, None).await.unwrap();
+    eventually("phone gets original history", || texts(&phone, &p_chat) == ["original history"]).await;
+    bob.edit_message(&history_id, "до связывания").await.unwrap();
     eventually("phone gets history", || texts(&phone, &p_chat) == ["до связывания"]).await;
     phone.set_pinned(&p_chat, true).unwrap();
     phone.set_app_setting("folders", r#"[{"name":"Работа"}]"#).unwrap();
@@ -72,6 +74,7 @@ async fn second_device_full_sync() {
     .await;
     let m_chat = by_gid(&mac, &gid).unwrap();
     assert_eq!(texts(&mac, &m_chat), ["до связывания"], "history came with the snapshot");
+    assert!(mac.messages(&m_chat, 10, None).unwrap()[0].edited_ms > 0, "snapshot retains edits");
     assert!(mac.chat(&m_chat).unwrap().pinned);
     assert_eq!(mac.app_setting("folders").unwrap().as_deref(), Some(r#"[{"name":"Работа"}]"#));
     assert_eq!(mac.chat(&m_chat).unwrap().title, "Bob");
@@ -91,6 +94,35 @@ async fn second_device_full_sync() {
     .await;
     eventually("bob sees it", || texts(&bob, &b_chat).last().map(String::as_str) == Some("пишу с мака")).await;
     assert_eq!(bob.messages(&b_chat, 10, None).unwrap().last().unwrap().sender_name, "Alice");
+
+    // Правку своего сообщения можно сделать с другого устройства аккаунта.
+    let own_id = phone.messages(&p_chat, 10, None).unwrap().last().unwrap().id.clone();
+    phone.edit_message(&own_id, "исправлено с телефона").await.unwrap();
+    eventually("edit on mac", || texts(&mac, &m_chat).last().map(String::as_str) == Some("исправлено с телефона"))
+        .await;
+    eventually("edit on bob", || texts(&bob, &b_chat).last().map(String::as_str) == Some("исправлено с телефона"))
+        .await;
+    mac.edit_message(&own_id, "исправлено с мака").await.unwrap();
+    eventually("edit back on phone", || texts(&phone, &p_chat).last().map(String::as_str) == Some("исправлено с мака"))
+        .await;
+    eventually("second edit on bob", || texts(&bob, &b_chat).last().map(String::as_str) == Some("исправлено с мака"))
+        .await;
+
+    let (p_edit, m_edit) =
+        tokio::join!(phone.edit_message(&own_id, "concurrent phone"), mac.edit_message(&own_id, "concurrent mac"));
+    p_edit.unwrap();
+    m_edit.unwrap();
+    eventually("concurrent edits converge", || {
+        let p = phone.messages(&p_chat, 10, None).unwrap().pop().unwrap();
+        let m = mac.messages(&m_chat, 10, None).unwrap().pop().unwrap();
+        let b = bob.messages(&b_chat, 10, None).unwrap().pop().unwrap();
+        p.text.starts_with("concurrent")
+            && p.text == m.text
+            && p.text == b.text
+            && p.edited_ms == m.edited_ms
+            && p.edited_ms == b.edited_ms
+    })
+    .await;
 
     // Прочитали на Mac — на телефоне счётчик тоже сброшен.
     assert!(phone.chat(&p_chat).unwrap().unread > 0);

@@ -202,6 +202,56 @@ async fn invite_chat_files_and_group() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn edit_text_and_caption() {
+    let node = node().await;
+    let dir = tempfile::tempdir().unwrap();
+    let alice = client(&dir, "Alice", &node).await;
+    let bob = client(&dir, "Bob", &node).await;
+    let (a_chat, link) = alice.create_chat(None).await.unwrap();
+    let b_chat = bob.accept_invite(&link).await.unwrap();
+    eventually("bob joins", || bob.chat(&b_chat).unwrap().state == ChatState::Active).await;
+    let id = alice.send_text(&a_chat, "original", None, None).await.unwrap();
+    eventually("original received", || texts(&bob, &b_chat) == ["original"]).await;
+    let original = bob.messages(&b_chat, 10, None).unwrap()[0].clone();
+    assert!(bob.edit_message(&id, "forged").await.is_err());
+    assert!(alice.edit_message(&id, "\u{2003}\n").await.is_err());
+    assert!(alice.edit_message(&id, &"x".repeat(20_000)).await.is_err());
+    assert_eq!(texts(&alice, &a_chat), ["original"], "failed edit must not change local text");
+    alice.edit_message(&id, "**edited**").await.unwrap();
+    eventually("edit received", || texts(&bob, &b_chat) == ["**edited**"]).await;
+    let edited = bob.messages(&b_chat, 10, None).unwrap()[0].clone();
+    assert!(edited.edited_ms > 0);
+    assert_eq!(edited.id, original.id);
+    assert_eq!(edited.ts, original.ts);
+    assert_eq!(bob.chat(&b_chat).unwrap().unread, 1, "edit is not a new unread message");
+    assert_eq!(bob.chat(&b_chat).unwrap().last_message.unwrap().text, "**edited**");
+    let src = dir.path().join("data.bin");
+    std::fs::write(&src, b"attachment").unwrap();
+    let att = OutgoingAttachment {
+        path: src.to_string_lossy().into_owned(),
+        kind: "file".into(),
+        name: "data.bin".into(),
+        mime: "application/octet-stream".into(),
+        ..Default::default()
+    };
+    let media_id = alice.send_attachment(&a_chat, att, "caption").await.unwrap();
+    eventually("media received", || texts(&bob, &b_chat).len() == 2).await;
+    alice.edit_message(&media_id, "").await.unwrap();
+    eventually("caption removed", || {
+        bob.messages(&b_chat, 10, None).unwrap().last().is_some_and(|m| m.text.is_empty() && m.edited_ms > 0)
+    })
+    .await;
+    let media = bob.messages(&b_chat, 10, None).unwrap().pop().unwrap();
+    assert!(media.attachment.is_some());
+    let path = bob.download(&media_id).await.unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), b"attachment");
+    drop(bob);
+    let bob = Client::open(&dir.path().join("Bob"), &node).await.unwrap();
+    assert_eq!(texts(&bob, &b_chat), ["**edited**", ""]);
+    assert!(bob.messages(&b_chat, 10, None).unwrap().iter().all(|m| m.edited_ms > 0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn state_survives_restart() {
     let node = node().await;
     let dir = tempfile::tempdir().unwrap();

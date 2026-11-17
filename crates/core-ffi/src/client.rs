@@ -157,6 +157,8 @@ pub struct MessageInfo {
     pub forwarded_from_id: Option<String>,
     /// Реакции в порядке появления.
     pub reactions: Vec<ReactionInfo>,
+    /// Время последней правки (0 — не редактировалось).
+    pub edited_ms: u64,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -380,6 +382,7 @@ fn message(m: cc::Message) -> MessageInfo {
             .into_iter()
             .map(|r| ReactionInfo { emoji: r.emoji, count: r.count, mine: r.mine, senders: r.senders })
             .collect(),
+        edited_ms: m.edited_ms,
     }
 }
 
@@ -635,6 +638,10 @@ impl CoreClient {
     /// Повторить отправку сообщения с ошибкой (выгрузит вложение, если оно не ушло).
     pub async fn retry_message(&self, message_id: String) -> Result<(), CoreError> {
         Ok(self.inner.retry_message(&message_id).await?)
+    }
+
+    pub async fn edit_message(&self, message_id: String, text: String) -> Result<(), CoreError> {
+        Ok(self.inner.edit_message(&message_id, &text).await?)
     }
 
     pub async fn delete_message_for_all(&self, message_id: String) -> Result<(), CoreError> {

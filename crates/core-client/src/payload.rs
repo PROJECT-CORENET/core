@@ -28,6 +28,13 @@ pub enum Payload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fwd_id: Option<String>,
     },
+    /// Правка текста/подписи; автор определяется MLS, а не полем в теле сообщения.
+    Edit {
+        id: String,
+        text: String,
+        ts: u64,
+        edit_id: String,
+    },
     /// Имя и аватар — только внутри группы, нода их не видит.
     Profile {
         name: String,

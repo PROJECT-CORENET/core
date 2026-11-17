@@ -181,6 +181,7 @@ pub struct Message {
     pub forwarded_from_id: Option<String>,
     /// Реакции в порядке появления.
     pub reactions: Vec<Reaction>,
+    pub edited_ms: u64,
 }
 
 /// Одна реакция под сообщением: эмодзи, сколько поставили и есть ли среди них моя.
@@ -861,6 +862,35 @@ impl Client {
         self.inner.send_payload(&chat, &payload).await.map(drop)
     }
 
+    /// Изменить своё отправленное сообщение. Медиа и исходное время не меняются.
+    pub async fn edit_message(&self, message_id: &str, text: &str) -> Result<()> {
+        let m = self.inner.store.message(message_id)?.ok_or(Error::Other("no such message".into()))?;
+        if m.sender_id != self.inner.me || !m.outgoing {
+            return Err(Error::Other("only the author can edit a message".into()));
+        }
+        if matches!(m.status, MessageStatus::Sending | MessageStatus::Failed) {
+            return Err(Error::Other("message must be sent before editing".into()));
+        }
+        if text.trim().is_empty() && m.attachment.is_none() {
+            return Err(Error::Other("message cannot be empty".into()));
+        }
+        if m.text == text {
+            return Ok(());
+        }
+        let chat = self.inner.store.chat(&m.chat_id)?.ok_or(Error::NoChat)?;
+        if chat.state != ChatState::Active {
+            return Err(Error::NotReady);
+        }
+        let ts = now_ms().max(m.edited_ms.saturating_add(1));
+        let edit_id = new_id();
+        let payload = Payload::Edit { id: m.id.clone(), text: text.into(), ts, edit_id: edit_id.clone() };
+        // Do not change local text if the node rejects the edit; the composer can retry it.
+        self.inner.send_payload(&chat, &payload).await?;
+        self.inner.store.edit_message(&chat.id, &self.inner.me, &m.id, text, ts, &edit_id)?;
+        self.inner.notify(Some(chat.id));
+        Ok(())
+    }
+
     /// Удалить у всех: своё сообщение удаляется и у участников.
     pub async fn delete_message_for_all(&self, message_id: &str) -> Result<()> {
         let Some(m) = self.inner.store.message(message_id)? else { return Ok(()) };
@@ -1027,6 +1057,7 @@ impl Inner {
             forwarded_from: m.fwd,
             forwarded_from_id: m.fwd_id,
             reactions,
+            edited_ms: m.edited_ms,
         }
     }
 
@@ -1324,6 +1355,8 @@ impl Inner {
             link,
             fwd: fwd.as_ref().map(|f| f.name.clone()),
             fwd_id: fwd.and_then(|f| f.id),
+            edited_ms: 0,
+            edit_id: String::new(),
         };
         self.store.insert_message(&row)?;
         self.store.touch_chat(chat_id, ts, 0)?;
@@ -1769,7 +1802,11 @@ impl Inner {
         if sender != self.me
             && matches!(
                 payload,
-                Payload::Message { .. } | Payload::React { .. } | Payload::Typing { .. } | Payload::Call { .. }
+                Payload::Message { .. }
+                    | Payload::Edit { .. }
+                    | Payload::React { .. }
+                    | Payload::Typing { .. }
+                    | Payload::Call { .. }
             )
             && self.is_blocked(sender)
         {
@@ -1796,6 +1833,8 @@ impl Inner {
                     link: link.and_then(|l| l.sanitized()),
                     fwd: fwd.map(|f| f.chars().take(64).collect()),
                     fwd_id: fwd_id.filter(|k| Forward::valid_id(k)),
+                    edited_ms: 0,
+                    edit_id: String::new(),
                 };
                 let inserted = if mine {
                     self.store.insert_message_touch(&row, ts, 0)?
@@ -1824,6 +1863,18 @@ impl Inner {
                                 warn!("⚠️ auto-download failed: {e}");
                             }
                         });
+                    }
+                }
+            }
+            Payload::Edit { id, text, ts, edit_id } => {
+                if text.len() <= MAX_PAYLOAD && edit_id.len() <= 64 {
+                    let valid = self.store.message(&id)?.is_some_and(|m| {
+                        m.chat_id == chat.id
+                            && m.sender_id == sender
+                            && (!text.trim().is_empty() || m.attachment.is_some())
+                    });
+                    if valid {
+                        self.store.edit_message(&chat.id, sender, &id, &text, ts, &edit_id)?;
                     }
                 }
             }
@@ -2046,5 +2097,60 @@ fn node_key(node: &str) -> String {
 }
 
 fn short(node: &str) -> String {
-    node.rsplit('@').next().unwrap_or(node).to_string()
+    node.rsplit('@').next().unwrap().to_string()
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    use core_node::{Config, Node, NodeIdentity};
+
+    async fn wait(mut f: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !f() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authenticated_member_cannot_edit_another_author_or_chat() {
+        let node = Node::bind(
+            Config { listen: "127.0.0.1:0".into(), ..Default::default() },
+            NodeIdentity::generate(),
+            core_node::Store::open_in_memory().unwrap(),
+        )
+        .await
+        .unwrap();
+        let addr = node.address().to_string();
+        tokio::spawn(node.run());
+        let dir = tempfile::tempdir().unwrap();
+        let alice = Client::open(&dir.path().join("alice"), &addr).await.unwrap();
+        let bob = Client::open(&dir.path().join("bob"), &addr).await.unwrap();
+        let (a_chat, link) = alice.create_chat(None).await.unwrap();
+        let b_chat = bob.accept_invite(&link).await.unwrap();
+        wait(|| bob.chat(&b_chat).unwrap().state == ChatState::Active).await;
+        let id = alice.send_text(&a_chat, "original", None, None).await.unwrap();
+        wait(|| !bob.messages(&b_chat, 10, None).unwrap().is_empty()).await;
+        let chat = bob.inner.store.chat(&b_chat).unwrap().unwrap();
+        let forged = Payload::Edit { id: id.clone(), text: "forged".into(), ts: now_ms(), edit_id: new_id() };
+        bob.inner.send_payload(&chat, &forged).await.unwrap();
+        bob.send_text(&b_chat, "barrier", None, None).await.unwrap();
+        wait(|| alice.messages(&a_chat, 10, None).unwrap().len() == 2).await;
+        assert_eq!(alice.messages(&a_chat, 10, None).unwrap()[0].text, "original");
+        assert_eq!(alice.messages(&a_chat, 10, None).unwrap()[0].edited_ms, 0);
+
+        // Even the correct author cannot target a message in a different chat.
+        let (other, link) = alice.create_chat(None).await.unwrap();
+        let b_other = bob.accept_invite(&link).await.unwrap();
+        wait(|| bob.chat(&b_other).unwrap().state == ChatState::Active).await;
+        let chat = alice.inner.store.chat(&other).unwrap().unwrap();
+        alice.inner.send_payload(&chat, &forged).await.unwrap();
+        alice.send_text(&other, "barrier", None, None).await.unwrap();
+        wait(|| bob.messages(&b_other, 10, None).unwrap().len() == 1).await;
+        assert_eq!(bob.messages(&b_chat, 10, None).unwrap()[0].text, "original");
+        assert_eq!(bob.messages(&b_chat, 10, None).unwrap()[0].edited_ms, 0);
+    }
 }

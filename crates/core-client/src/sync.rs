@@ -477,6 +477,8 @@ impl Inner {
                 link: m.link,
                 fwd: m.fwd,
                 fwd_id: m.fwd_id,
+                edited_ms: m.edited_ms,
+                edit_id: m.edit_id,
             })
             .collect();
         Ok(SnapChat {
@@ -529,6 +531,8 @@ impl Inner {
                 link: m.link.clone(),
                 fwd: m.fwd.clone(),
                 fwd_id: m.fwd_id.clone(),
+                edited_ms: m.edited_ms,
+                edit_id: m.edit_id.clone(),
             })?;
             for (emoji, sender) in &m.reactions {
                 self.store.set_reaction(&m.id, sender, Some(emoji), m.ts)?;

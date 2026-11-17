@@ -96,6 +96,8 @@ pub struct MessageRow {
     pub fwd: Option<String>,
     /// Ключ автора пересланного.
     pub fwd_id: Option<String>,
+    pub edited_ms: u64,
+    pub edit_id: String,
 }
 
 /// Резервный журнал чата на другой ноде: если нода чата пропадёт, переписка переезжает сюда.
@@ -202,7 +204,7 @@ fn call_row(r: &Row) -> Result<CallRow> {
 const CHAT_COLS: &str = "id, group_id, title, custom_title, node, log_id, write_sk, read_sk, read_offset, state, \
                          created_ms, last_ms, unread, muted, pinned";
 const MSG_COLS: &str =
-    "id, chat_id, sender_id, outgoing, ts, text, attachment, status, file_path, reply_to, link, fwd, fwd_id";
+    "id, chat_id, sender_id, outgoing, ts, text, attachment, status, file_path, reply_to, link, fwd, fwd_id, edited_ms, edit_id";
 
 fn chat_row(r: &Row) -> Result<ChatRow> {
     Ok(ChatRow {
@@ -240,6 +242,8 @@ fn message_row(r: &Row) -> Result<MessageRow> {
         link: r.get::<_, Option<String>>(10)?.and_then(|l| serde_json::from_str(&l).ok()),
         fwd: r.get(11)?,
         fwd_id: r.get(12)?,
+        edited_ms: r.get::<_, i64>(13)? as u64,
+        edit_id: r.get(14)?,
     })
 }
 
@@ -302,6 +306,13 @@ impl Store {
             conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = 'fwd_id'")?.exists([])?;
         if !has_fwd_id {
             conn.execute_batch("ALTER TABLE messages ADD COLUMN fwd_id TEXT")?;
+        }
+        for (name, definition) in [("edited_ms", "INTEGER NOT NULL DEFAULT 0"), ("edit_id", "TEXT NOT NULL DEFAULT ''")]
+        {
+            let exists = conn.prepare("SELECT 1 FROM pragma_table_info('messages') WHERE name = ?")?.exists([name])?;
+            if !exists {
+                conn.execute_batch(&format!("ALTER TABLE messages ADD COLUMN {name} {definition}"))?;
+            }
         }
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -772,7 +783,7 @@ impl Store {
             let attachment = m.attachment.as_ref().map(|a| serde_json::to_string(a).unwrap());
             let link = m.link.as_ref().map(|l| serde_json::to_string(l).unwrap());
             let n = c.execute(
-                &format!("INSERT OR IGNORE INTO messages ({MSG_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)"),
+                &format!("INSERT OR IGNORE INTO messages ({MSG_COLS}) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"),
                 params![
                     m.id,
                     m.chat_id,
@@ -786,7 +797,9 @@ impl Store {
                     m.reply_to,
                     link,
                     m.fwd,
-                    m.fwd_id
+                    m.fwd_id,
+                    m.edited_ms as i64,
+                    m.edit_id
                 ],
             )?;
             Ok(n > 0)
@@ -825,6 +838,44 @@ impl Store {
 
     pub fn set_status(&self, id: &str, status: MessageStatus) -> Result<()> {
         self.with(|c| c.execute("UPDATE messages SET status = ? WHERE id = ?", params![status as i64, id]).map(drop))
+    }
+
+    /// MLS authenticates `sender`; scope by both author and chat so a member cannot edit someone else's message.
+    /// Equal-time edits converge by edit id, independently of arrival order on different devices.
+    pub fn edit_message(
+        &self,
+        chat_id: &str,
+        sender: &str,
+        id: &str,
+        text: &str,
+        ts: u64,
+        edit_id: &str,
+    ) -> Result<bool> {
+        if ts == 0 || ts > i64::MAX as u64 || edit_id.is_empty() {
+            return Ok(false);
+        }
+        self.with(|c| {
+            if text.trim().is_empty() {
+                let has_attachment: bool = c
+                    .query_row(
+                        "SELECT attachment IS NOT NULL FROM messages WHERE id = ? AND chat_id = ? AND sender_id = ?",
+                        params![id, chat_id, sender],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                if !has_attachment {
+                    return Ok(false);
+                }
+            }
+            c.execute(
+                "UPDATE messages SET text = ?1, link = NULL, edited_ms = ?2, edit_id = ?3
+                 WHERE id = ?4 AND chat_id = ?5 AND sender_id = ?6
+                 AND (edited_ms < ?2 OR (edited_ms = ?2 AND edit_id < ?3))",
+                params![text, ts as i64, edit_id, id, chat_id, sender],
+            )
+            .map(|n| n > 0)
+        })
     }
 
     pub fn set_attachment(&self, id: &str, a: &AttachmentRef) -> Result<()> {
@@ -1003,7 +1054,60 @@ mod tests {
             link: None,
             fwd: None,
             fwd_id: None,
+            edited_ms: 0,
+            edit_id: String::new(),
         }
+    }
+
+    #[test]
+    fn edits_are_scoped_ordered_and_persistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.db");
+        let store = Store::open(&path, None).unwrap();
+        let mut m = message("m", Some("cached.jpg"));
+        m.text = "original".into();
+        store.insert_message(&m).unwrap();
+        assert!(!store.edit_message("other-chat", "me", "m", "forged", 5, "a").unwrap());
+        assert!(!store.edit_message("c", "other-author", "m", "forged", 5, "a").unwrap());
+        assert!(store.edit_message("c", "me", "m", "new", 5, "b").unwrap());
+        assert!(!store.edit_message("c", "me", "m", "old", 4, "z").unwrap());
+        assert!(!store.edit_message("c", "me", "m", "loser", 5, "a").unwrap());
+        assert!(!store.edit_message("c", "me", "m", "duplicate", 5, "b").unwrap());
+        assert!(store.edit_message("c", "me", "m", "winner", 5, "c").unwrap());
+        assert!(store.edit_message("c", "me", "m", "", 6, "d").unwrap(), "empty media caption");
+        drop(store);
+        let store = Store::open(&path, None).unwrap();
+        let edited = store.message("m").unwrap().unwrap();
+        assert_eq!(edited.text, "");
+        assert_eq!((edited.edited_ms, edited.edit_id.as_str()), (6, "d"));
+        assert_eq!(edited.ts, m.ts);
+        assert_eq!(edited.attachment, m.attachment);
+        assert_eq!(edited.file_path, m.file_path);
+        store.delete_message("m").unwrap();
+        assert!(!store.edit_message("c", "me", "m", "resurrect", 7, "e").unwrap());
+        let mut text = message("text", None);
+        text.attachment = None;
+        text.text = "keep".into();
+        store.insert_message(&text).unwrap();
+        assert!(!store.edit_message("c", "me", "text", " \n\t", 1, "a").unwrap());
+    }
+
+    #[test]
+    fn edits_migrate_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.db");
+        let store = Store::open(&path, None).unwrap();
+        store.insert_message(&message("old", None)).unwrap();
+        drop(store);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("ALTER TABLE messages DROP COLUMN edited_ms; ALTER TABLE messages DROP COLUMN edit_id;")
+            .unwrap();
+        drop(conn);
+        let store = Store::open(&path, None).unwrap();
+        let m = store.message("old").unwrap().unwrap();
+        assert_eq!(m.edited_ms, 0);
+        assert!(m.edit_id.is_empty());
+        assert!(store.edit_message("c", "me", "old", "updated", 1, "a").unwrap());
     }
 
     #[test]

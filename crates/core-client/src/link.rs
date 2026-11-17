@@ -156,6 +156,10 @@ pub(crate) struct SnapMessage {
     /// (эмодзи, ключ поставившего).
     #[serde(default)]
     pub reactions: Vec<(String, String)>,
+    #[serde(default)]
+    pub edited_ms: u64,
+    #[serde(default)]
+    pub edit_id: String,
 }
 
 struct Peer {
