@@ -43,7 +43,8 @@ async fn invite_chat_files_and_group() {
     let (a_chat, link) = alice.create_chat(None).await.unwrap();
     assert!(link.starts_with("core-invite:"));
     let b_chat = bob.accept_invite(&link).await.unwrap();
-    assert_eq!(bob.chat(&b_chat).unwrap().state, ChatState::Joining);
+    // Под нагрузкой Алиса успевает принять Боба ещё до этой проверки — тогда чат уже активен.
+    assert!(matches!(bob.chat(&b_chat).unwrap().state, ChatState::Joining | ChatState::Active));
     eventually("bob joins", || bob.chat(&b_chat).unwrap().state == ChatState::Active).await;
 
     // Имена приходят внутри MLS: у Алисы чат называется «Bob», у Боба — «Alice».

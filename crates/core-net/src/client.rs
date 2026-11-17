@@ -18,7 +18,9 @@ use crate::{session, NetError, NodeAddr};
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const EVENT_QUEUE: usize = 1024;
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Response>>>>;
+/// Ждущие ответа запросы; `None` — соединение закрыто: новые запросы сразу получают `Closed`,
+/// а не ждут тайм-аута (запись в только что закрытый сокет часто проходит без ошибки).
+type Pending = Arc<Mutex<Option<HashMap<u64, oneshot::Sender<Response>>>>>;
 
 pub struct Client {
     writer: tokio::sync::Mutex<session::NoiseWriter>,
@@ -41,7 +43,7 @@ impl Client {
 
     async fn connect_mode(addr: &NodeAddr, mode: session::Mode) -> Result<(Self, mpsc::Receiver<Event>), NetError> {
         let session = session::connect_mode(addr, mode).await?;
-        let pending: Pending = Arc::default();
+        let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
         let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE);
         let reader_task = tokio::spawn(read_loop(session.reader, pending.clone(), events_tx));
         let client = Self {
@@ -74,11 +76,14 @@ impl Client {
         }
         let corr_id = req.corr_id;
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(corr_id, tx);
+        match self.pending.lock().unwrap().as_mut() {
+            Some(pending) => pending.insert(corr_id, tx),
+            None => return Err(NetError::Closed),
+        };
 
         let sent = self.writer.lock().await.send(FrameType::Request, &req.encode_to_vec()).await;
         if let Err(e) = sent {
-            self.pending.lock().unwrap().remove(&corr_id);
+            self.forget(corr_id);
             return Err(e);
         }
 
@@ -86,7 +91,7 @@ impl Client {
             Ok(Ok(resp)) => resp,
             Ok(Err(_)) => return Err(NetError::Closed),
             Err(_) => {
-                self.pending.lock().unwrap().remove(&corr_id);
+                self.forget(corr_id);
                 return Err(NetError::Timeout);
             }
         };
@@ -106,6 +111,12 @@ impl Client {
         self.writer.lock().await.send(FrameType::Request, &req.encode_to_vec()).await
     }
 
+    fn forget(&self, corr_id: u64) {
+        if let Some(pending) = self.pending.lock().unwrap().as_mut() {
+            pending.remove(&corr_id);
+        }
+    }
+
     fn next_corr_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
@@ -122,7 +133,7 @@ async fn read_loop(mut reader: session::NoiseReader, pending: Pending, events: m
         match ty {
             FrameType::Response => {
                 let Ok(resp) = Response::decode(&*body) else { break };
-                if let Some(tx) = pending.lock().unwrap().remove(&resp.corr_id) {
+                if let Some(tx) = pending.lock().unwrap().as_mut().and_then(|p| p.remove(&resp.corr_id)) {
                     let _ = tx.send(resp);
                 }
             }
@@ -134,6 +145,6 @@ async fn read_loop(mut reader: session::NoiseReader, pending: Pending, events: m
             FrameType::Request => break,
         }
     }
-    // Ожидающие запросы получат NetError::Closed.
-    pending.lock().unwrap().clear();
+    // Ожидающие запросы получат NetError::Closed, новые — тоже, сразу.
+    pending.lock().unwrap().take();
 }

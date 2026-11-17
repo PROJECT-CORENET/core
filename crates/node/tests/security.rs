@@ -368,3 +368,33 @@ async fn request_flood_does_not_block_other_clients() {
         t.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn requests_on_dead_connection_fail_fast() {
+    // Нода упала: запросы по старому соединению сразу получают Closed, а не висят до тайм-аута
+    // (иначе клиент на полминуты застревал в переподключении).
+    let (addr, rt) = std::thread::spawn(|| {
+        let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(1).enable_all().build().unwrap();
+        let addr = rt.block_on(async {
+            let config = Config { listen: "127.0.0.1:0".into(), ..Config::default() };
+            let node = Node::bind(config, NodeIdentity::generate(), Store::open_in_memory().unwrap()).await.unwrap();
+            let addr = node.address();
+            tokio::spawn(node.run());
+            addr
+        });
+        (addr, rt)
+    })
+    .join()
+    .unwrap();
+    let (c, _ev) = Client::connect(&addr).await.unwrap();
+    c.request(request::Body::Ping(Ping {}), None).await.unwrap();
+
+    rt.shutdown_background();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for _ in 0..3 {
+        let reply = tokio::time::timeout(Duration::from_secs(2), c.request(request::Body::Ping(Ping {}), None))
+            .await
+            .expect("запрос по мёртвому соединению завис");
+        assert!(matches!(reply, Err(NetError::Closed | NetError::Io(_))), "{reply:?}");
+    }
+}
