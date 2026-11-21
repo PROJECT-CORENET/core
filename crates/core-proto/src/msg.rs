@@ -149,6 +149,8 @@ pub struct PushRegistered {
     pub capability: Vec<u8>,
 }
 
+pub const MAX_PUSH_PREVIEW: usize = 2700;
+
 /// Opaque notification capability. A 12-byte call identifier is required for VoIP.
 #[derive(Clone, PartialEq, Message)]
 pub struct PushNotify {
@@ -156,6 +158,8 @@ pub struct PushNotify {
     pub capability: Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
     pub call_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub preview: Vec<u8>,
 }
 
 /// Attach a device's opaque routes to a journal. Signed with the journal read key.
@@ -248,6 +252,8 @@ pub struct LogAppend {
     pub call_id: Vec<u8>,
     #[prost(bytes = "vec", tag = "5")]
     pub sender_slot: Vec<u8>,
+    #[prost(bytes = "vec", tag = "6")]
+    pub preview: Vec<u8>,
 }
 
 /// MLS-коммит: принимается, только если для `epoch` коммита ещё нет (compare-and-swap).
@@ -337,6 +343,8 @@ pub struct Pong {
     pub time_ms: u64,
     #[prost(bool, tag = "2")]
     pub push_forwarding: bool,
+    #[prost(bool, tag = "3")]
+    pub push_previews: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]

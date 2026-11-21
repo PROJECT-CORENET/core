@@ -203,6 +203,8 @@ pub struct AttachmentRef {
     /// Маленькое превью (JPEG) — показывается сразу, до скачивания.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "b64_opt")]
     pub thumb: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "b64_opt")]
+    pub notification_thumb: Option<Vec<u8>>,
     #[serde(default)]
     pub w: u32,
     #[serde(default)]

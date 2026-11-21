@@ -14,6 +14,7 @@ fn outgoing_attachment(attachment: NewAttachment) -> cc::OutgoingAttachment {
         name: attachment.name,
         mime: attachment.mime,
         thumb: attachment.thumb,
+        notification_thumb: attachment.notification_thumb,
         width: attachment.width,
         height: attachment.height,
         duration_ms: attachment.duration_ms,
@@ -331,6 +332,8 @@ pub struct NewAttachment {
     pub name: String,
     pub mime: String,
     pub thumb: Option<Vec<u8>>,
+    #[uniffi(default = None)]
+    pub notification_thumb: Option<Vec<u8>>,
     pub width: u32,
     pub height: u32,
     pub duration_ms: u64,
@@ -498,6 +501,10 @@ pub fn parse_invite(link: String) -> Option<InviteInfo> {
 impl CoreClient {
     pub fn set_listener(&self, listener: Arc<dyn CoreListener>) {
         self.inner.set_listener(Arc::new(ListenerBridge(listener)));
+    }
+
+    pub async fn notification_keys(&self, chat_ids: Vec<String>) -> Result<String, CoreError> {
+        Ok(self.inner.notification_keys(&chat_ids).await?)
     }
 
     pub async fn register_push(

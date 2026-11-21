@@ -357,7 +357,11 @@ impl Conn {
         }
 
         match body {
-            B::Ping(_) => Ok(R::Pong(Pong { time_ms: now, push_forwarding: self.state.push_forward.is_some() })),
+            B::Ping(_) => Ok(R::Pong(Pong {
+                time_ms: now,
+                push_forwarding: self.state.push_forward.is_some(),
+                push_previews: self.state.push_forward.is_some(),
+            })),
             B::PushRegister(registration) => {
                 let push = self.state.push.as_ref().ok_or_else(|| Fail::bad("push gateway unavailable"))?;
                 let capability = push.register(registration).map_err(|_| Fail::bad("push registration refused"))?;
@@ -471,6 +475,9 @@ impl Conn {
 
             B::LogAppend(c) => {
                 check_blob(&c.blob)?;
+                if c.preview.len() > core_proto::msg::MAX_PUSH_PREVIEW || (!c.preview.is_empty() && !c.alert) {
+                    return Err(Fail::bad("invalid notification preview"));
+                }
                 let keys = store.log_keys(&c.log_id)?.ok_or_else(Fail::auth)?;
                 self.verify(req, &keys.write_pk)?;
                 if !c.call_id.is_empty() {
@@ -487,7 +494,11 @@ impl Conn {
                         Ok(targets) => {
                             for capability in targets {
                                 if forward
-                                    .try_send(core_proto::msg::PushNotify { capability, call_id: c.call_id.clone() })
+                                    .try_send(core_proto::msg::PushNotify {
+                                        capability,
+                                        call_id: c.call_id.clone(),
+                                        preview: c.preview.clone(),
+                                    })
                                     .is_err()
                                 {
                                     debug!("push forwarding queue full");

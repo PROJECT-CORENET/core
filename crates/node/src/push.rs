@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, ensure, Context, Result};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use chacha20poly1305::{aead::Aead, KeyInit, XChaCha20Poly1305, XNonce};
 use core_crypto::{random_bytes, sha256};
 use core_proto::msg::{PushNotify, PushRegister};
@@ -32,6 +35,7 @@ struct Notification {
     sandbox: bool,
     call: Option<Vec<u8>>,
     queued_at: Instant,
+    preview: Vec<u8>,
 }
 
 struct Apns {
@@ -114,6 +118,7 @@ impl Gateway {
 
     pub(crate) fn notify(&self, request: &PushNotify) -> Result<()> {
         ensure!(request.capability.len() == 32, "invalid capability");
+        ensure!(request.preview.len() <= core_proto::msg::MAX_PUSH_PREVIEW, "invalid notification preview");
         let db = self.db.lock().unwrap();
         let now = now_ms() as i64;
         let target = db
@@ -147,6 +152,7 @@ impl Gateway {
                 sandbox,
                 call: voip.then(|| request.call_id.clone()),
                 queued_at: Instant::now(),
+                preview: request.preview.clone(),
             })
             .map_err(|_| anyhow::anyhow!("push queue full"))?;
         db.execute("UPDATE push_targets SET next_send = ? WHERE handle = ?", params![now + 3_000, request.capability])?;
@@ -195,13 +201,15 @@ impl Apns {
         let (topic, push_type, priority, expires, payload) = if let Some(id) = &item.call {
             (format!("{}.voip", self.topic), "voip", "10", 0, json!({"aps":{},"call":hex::encode(id)}))
         } else {
-            (
-                self.topic.clone(),
-                "alert",
-                "10",
-                now_ms() / 1000 + 300,
-                json!({"aps":{"alert":{"title":"CORE","loc-key":"Новое сообщение"},"sound":"default"}}),
-            )
+            (self.topic.clone(), "alert", "10", now_ms() / 1000 + 300, {
+                let mut payload =
+                    json!({"aps":{"alert":{"title":"CORE","loc-key":"Новое сообщение"},"sound":"default"}});
+                if !item.preview.is_empty() {
+                    payload["aps"]["mutable-content"] = json!(1);
+                    payload["core_preview"] = json!(STANDARD.encode(&item.preview));
+                }
+                payload
+            })
         };
         let jwt = self.jwt();
         // Curl's stdin config keeps the device token and authorization header out of argv.
@@ -295,9 +303,11 @@ mod tests {
 
         assert!(!std::fs::read(&path).unwrap().windows(token.len()).any(|window| window == token));
         let gateway = Gateway::open(Connection::open(&path).unwrap(), &identity, sender).unwrap();
-        assert!(gateway.notify(&PushNotify { capability: vec![0; 32], call_id: vec![1; 12] }).is_err());
-        assert!(gateway.notify(&PushNotify { capability: normal, call_id: vec![1; 12] }).is_err());
-        let call = PushNotify { capability, call_id: vec![1; 12] };
+        assert!(gateway
+            .notify(&PushNotify { capability: vec![0; 32], call_id: vec![1; 12], preview: vec![] })
+            .is_err());
+        assert!(gateway.notify(&PushNotify { capability: normal, call_id: vec![1; 12], preview: vec![] }).is_err());
+        let call = PushNotify { capability, call_id: vec![1; 12], preview: vec![] };
         gateway.notify(&call).unwrap();
         gateway.notify(&call).unwrap();
         let item = receiver.try_recv().unwrap();

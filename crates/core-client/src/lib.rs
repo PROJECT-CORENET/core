@@ -11,6 +11,7 @@
 mod calls;
 mod link;
 mod media;
+mod notification;
 pub mod payload;
 mod store;
 mod sync;
@@ -224,6 +225,7 @@ pub struct OutgoingAttachment {
     pub name: String,
     pub mime: String,
     pub thumb: Option<Vec<u8>>,
+    pub notification_thumb: Option<Vec<u8>>,
     pub width: u32,
     pub height: u32,
     pub duration_ms: u64,
@@ -306,7 +308,7 @@ struct Inner {
     me: String,
     engine: tokio::sync::Mutex<Engine>,
     conns: Mutex<HashMap<String, Arc<NetClient>>>,
-    push_nodes: Mutex<std::collections::HashSet<String>>,
+    push_nodes: Mutex<HashMap<String, bool>>,
     connecting: tokio::sync::Mutex<()>,
     events: mpsc::UnboundedSender<(String, Event)>,
     listener: RwLock<Option<Arc<dyn Listener>>>,
@@ -905,6 +907,7 @@ impl Client {
             mime: att.mime,
             size,
             thumb,
+            notification_thumb: att.notification_thumb.filter(|thumb| thumb.len() <= 1_350),
             w: att.width,
             h: att.height,
             duration_ms: att.duration_ms,
@@ -1404,11 +1407,13 @@ impl Inner {
         let (client, mut events) =
             tokio::time::timeout(REQUEST_TIMEOUT, NetClient::connect(&addr)).await.map_err(|_| NetError::Timeout)??;
         let client = Arc::new(client);
-        if matches!(
-            tokio::time::timeout(Duration::from_secs(1), client.request(request::Body::Ping(Default::default()), None)).await,
-            Ok(Ok(response::Body::Pong(pong))) if pong.push_forwarding
-        ) {
-            self.push_nodes.lock().unwrap().insert(node.to_owned());
+        if let Ok(Ok(response::Body::Pong(pong))) =
+            tokio::time::timeout(Duration::from_secs(1), client.request(request::Body::Ping(Default::default()), None))
+                .await
+        {
+            if pong.push_forwarding {
+                self.push_nodes.lock().unwrap().insert(node.to_owned(), pong.push_previews);
+            }
         }
         self.conns.lock().unwrap().insert(node.to_string(), client.clone());
         debug!("🔌 connected to {}", short(node));
@@ -1470,7 +1475,7 @@ impl Inner {
     ) -> Result<()> {
         use core_proto::msg::{NotifySet, PushRegister};
         let conn = self.conn(&chat.node).await?;
-        if !self.push_nodes.lock().unwrap().contains(&chat.node) {
+        if !self.push_nodes.lock().unwrap().contains_key(&chat.node) {
             return Ok(());
         }
         let scope = self.push_slot(&chat.log_id, b"CORE/Push/scope");
@@ -1510,8 +1515,11 @@ impl Inner {
         let blob = out.tls_serialize_detached().map_err(mls)?;
         let write = key(&chat.write_sk);
         let mut append = LogAppend { log_id: chat.log_id.clone(), blob, ..Default::default() };
-        if self.push_nodes.lock().unwrap().contains(&chat.node) {
+        if let Some(previews) = self.push_nodes.lock().unwrap().get(&chat.node).copied() {
             append.alert = matches!(payload, Payload::Message { .. });
+            if append.alert && previews {
+                append.preview = notification::seal_preview(&engine, &group, payload).unwrap_or_default();
+            }
             if let Payload::Call { id, op: payload::CallOp::Ring { .. } } = payload {
                 append.call_id = hex::decode(id).unwrap_or_default();
             }

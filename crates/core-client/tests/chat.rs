@@ -142,6 +142,7 @@ async fn invite_chat_files_and_group() {
         name: "photo.jpg".into(),
         mime: "image/jpeg".into(),
         thumb: Some(vec![1, 2, 3]),
+        notification_thumb: None,
         width: 800,
         height: 600,
         spoiler: true,
