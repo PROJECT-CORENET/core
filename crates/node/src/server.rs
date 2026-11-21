@@ -54,6 +54,8 @@ pub(crate) struct State {
     pub peers: Peers,
     pub seen: Mutex<SeenCache>,
     pub presence: Mutex<PresenceTable>,
+    pub push: Option<crate::push::Gateway>,
+    push_forward: Option<mpsc::Sender<core_proto::msg::PushNotify>>,
     pub own_descriptor: Mutex<NodeDescriptor>,
     /// Клиентские соединения (без соседей-нод).
     pub clients: AtomicUsize,
@@ -81,7 +83,11 @@ impl Node {
         let mut directory = Directory::default();
         let _ = directory.apply_descriptor(own_descriptor.clone(), now);
 
+        let push = crate::push::Gateway::from_env(&identity).map_err(std::io::Error::other)?;
+        let push_forward = crate::push::forwarder()?;
         let state = State {
+            push,
+            push_forward,
             node_id: identity.node_id(),
             identity,
             store,
@@ -351,7 +357,17 @@ impl Conn {
         }
 
         match body {
-            B::Ping(_) => Ok(R::Pong(Pong { time_ms: now })),
+            B::Ping(_) => Ok(R::Pong(Pong { time_ms: now, push_forwarding: self.state.push_forward.is_some() })),
+            B::PushRegister(registration) => {
+                let push = self.state.push.as_ref().ok_or_else(|| Fail::bad("push gateway unavailable"))?;
+                let capability = push.register(registration).map_err(|_| Fail::bad("push registration refused"))?;
+                Ok(R::PushRegistered(core_proto::msg::PushRegistered { capability }))
+            }
+            B::PushNotify(notification) => {
+                let push = self.state.push.as_ref().ok_or_else(|| Fail::bad("push gateway unavailable"))?;
+                push.notify(notification).map_err(|_| Fail::auth())?;
+                Ok(R::Done(Done {}))
+            }
 
             // ───── Звонки ─────
             B::RelayJoin(c) => {
@@ -437,13 +453,51 @@ impl Conn {
                 Ok(R::Done(Done {}))
             }
 
+            B::NotifySet(c) => {
+                if self.state.push_forward.is_none() {
+                    return Err(Fail::bad("push forwarding unavailable"));
+                }
+                check_len(&c.slot, 16, "notification slot")?;
+                for handle in [&c.alert, &c.voip] {
+                    if !handle.is_empty() {
+                        check_len(handle, 32, "notification capability")?;
+                    }
+                }
+                let keys = store.log_keys(&c.log_id)?.ok_or_else(Fail::auth)?;
+                self.verify(req, &keys.read_pk)?;
+                store.notify_set(c, now)?;
+                Ok(R::Done(Done {}))
+            }
+
             B::LogAppend(c) => {
                 check_blob(&c.blob)?;
                 let keys = store.log_keys(&c.log_id)?.ok_or_else(Fail::auth)?;
                 self.verify(req, &keys.write_pk)?;
+                if !c.call_id.is_empty() {
+                    check_len(&c.call_id, 12, "call id")?;
+                }
+                if c.alert || !c.call_id.is_empty() {
+                    check_len(&c.sender_slot, 16, "sender notification slot")?;
+                }
                 let entry = store.log_append(&c.log_id, &c.blob, now)?;
                 let offset = entry.offset;
                 self.state.hub.publish_log(&c.log_id, entry);
+                if let Some(forward) = self.state.push_forward.as_ref().filter(|_| c.alert || !c.call_id.is_empty()) {
+                    match store.notify_targets(&c.log_id, &c.sender_slot, !c.call_id.is_empty(), now) {
+                        Ok(targets) => {
+                            for capability in targets {
+                                if forward
+                                    .try_send(core_proto::msg::PushNotify { capability, call_id: c.call_id.clone() })
+                                    .is_err()
+                                {
+                                    debug!("push forwarding queue full");
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => warn!("failed to look up notification routes"),
+                    }
+                }
                 Ok(R::LogAppended(LogAppended { offset }))
             }
 

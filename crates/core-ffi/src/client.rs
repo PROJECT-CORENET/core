@@ -7,6 +7,24 @@ use core_client as cc;
 
 use crate::CoreError;
 
+fn outgoing_attachment(attachment: NewAttachment) -> cc::OutgoingAttachment {
+    cc::OutgoingAttachment {
+        path: attachment.path,
+        kind: attachment.kind,
+        name: attachment.name,
+        mime: attachment.mime,
+        thumb: attachment.thumb,
+        width: attachment.width,
+        height: attachment.height,
+        duration_ms: attachment.duration_ms,
+        waveform: attachment.waveform,
+        spoiler: attachment.spoiler,
+        spoiler_hearts: attachment.spoiler_hearts,
+        forwarded_from: attachment.forwarded_from,
+        forwarded_from_id: attachment.forwarded_from_id,
+    }
+}
+
 impl From<cc::Error> for CoreError {
     fn from(e: cc::Error) -> Self {
         match e {
@@ -133,6 +151,7 @@ pub struct AttachmentInfo {
     pub duration_ms: u64,
     pub waveform: Option<Vec<u8>>,
     pub spoiler: bool,
+    pub spoiler_hearts: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -317,6 +336,7 @@ pub struct NewAttachment {
     pub duration_ms: u64,
     pub waveform: Option<Vec<u8>>,
     pub spoiler: bool,
+    pub spoiler_hearts: bool,
     /// Пересылка: имя автора оригинала.
     pub forwarded_from: Option<String>,
     /// Пересылка: ключ автора оригинала.
@@ -365,6 +385,7 @@ fn message(m: cc::Message) -> MessageInfo {
             duration_ms: a.duration_ms,
             waveform: a.wave,
             spoiler: a.spoiler,
+            spoiler_hearts: a.spoiler_hearts,
         }),
         local_path: m.local_path,
         reply_to: m.reply_to,
@@ -477,6 +498,16 @@ pub fn parse_invite(link: String) -> Option<InviteInfo> {
 impl CoreClient {
     pub fn set_listener(&self, listener: Arc<dyn CoreListener>) {
         self.inner.set_listener(Arc::new(ListenerBridge(listener)));
+    }
+
+    pub async fn register_push(
+        &self,
+        gateway: String,
+        sandbox: bool,
+        alert: Option<Vec<u8>>,
+        voip: Option<Vec<u8>>,
+    ) -> Result<(), CoreError> {
+        Ok(self.inner.register_push(&gateway, sandbox, alert, voip).await?)
     }
 
     pub fn set_default_node(&self, node: String) {
@@ -605,21 +636,17 @@ impl CoreClient {
         attachment: NewAttachment,
         caption: String,
     ) -> Result<String, CoreError> {
-        let a = cc::OutgoingAttachment {
-            path: attachment.path,
-            kind: attachment.kind,
-            name: attachment.name,
-            mime: attachment.mime,
-            thumb: attachment.thumb,
-            width: attachment.width,
-            height: attachment.height,
-            duration_ms: attachment.duration_ms,
-            waveform: attachment.waveform,
-            spoiler: attachment.spoiler,
-            forwarded_from: attachment.forwarded_from,
-            forwarded_from_id: attachment.forwarded_from_id,
-        };
-        Ok(self.inner.send_attachment(&chat_id, a, &caption).await?)
+        Ok(self.inner.send_attachment(&chat_id, outgoing_attachment(attachment), &caption).await?)
+    }
+
+    pub async fn accept_shared(
+        &self,
+        chat_id: String,
+        id: String,
+        text: String,
+        attachment: Option<NewAttachment>,
+    ) -> Result<(), CoreError> {
+        Ok(self.inner.accept_shared(&chat_id, id, &text, attachment.map(outgoing_attachment)).await?)
     }
 
     pub async fn download(&self, message_id: String) -> Result<String, CoreError> {
@@ -738,6 +765,14 @@ impl CoreClient {
 
     pub fn app_setting(&self, key: String) -> Result<Option<String>, CoreError> {
         Ok(self.inner.app_setting(&key)?)
+    }
+
+    pub fn drafts(&self) -> Result<std::collections::HashMap<String, String>, CoreError> {
+        Ok(self.inner.drafts()?)
+    }
+
+    pub fn set_draft(&self, chat_id: String, text: String) -> Result<(), CoreError> {
+        Ok(self.inner.set_draft(&chat_id, &text)?)
     }
 
     /// Сообщить о себе: имя устройства, платформа, нода подключения.

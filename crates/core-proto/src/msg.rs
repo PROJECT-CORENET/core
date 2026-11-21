@@ -49,7 +49,7 @@ pub struct Request {
     pub auth_sig: Vec<u8>,
     #[prost(
         oneof = "request::Body",
-        tags = "10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 30, 31, 32, 40, 41, 50, 51, 52"
+        tags = "10, 11, 12, 13, 14, 15, 16, 20, 21, 22, 23, 24, 25, 30, 31, 32, 40, 41, 50, 51, 52, 60, 61, 62"
     )]
     pub body: Option<request::Body>,
 }
@@ -103,6 +103,12 @@ pub mod request {
         /// Без ответа (`corr_id = 0`): кадр звонка не ждёт подтверждения.
         #[prost(message, tag = "52")]
         RelaySend(RelaySend),
+        #[prost(message, tag = "60")]
+        PushRegister(PushRegister),
+        #[prost(message, tag = "61")]
+        PushNotify(PushNotify),
+        #[prost(message, tag = "62")]
+        NotifySet(NotifySet),
     }
 }
 
@@ -122,6 +128,47 @@ impl Request {
         out.extend_from_slice(&encoded);
         out
     }
+}
+
+/// Register an APNs token over the gateway's Noise connection.
+#[derive(Clone, PartialEq, Message)]
+pub struct PushRegister {
+    #[prost(bytes = "vec", tag = "1")]
+    pub token: Vec<u8>,
+    #[prost(bool, tag = "2")]
+    pub sandbox: bool,
+    #[prost(bool, tag = "3")]
+    pub voip: bool,
+    #[prost(bytes = "vec", tag = "4")]
+    pub scope: Vec<u8>,
+}
+
+#[derive(Clone, PartialEq, Message)]
+pub struct PushRegistered {
+    #[prost(bytes = "vec", tag = "1")]
+    pub capability: Vec<u8>,
+}
+
+/// Opaque notification capability. A 12-byte call identifier is required for VoIP.
+#[derive(Clone, PartialEq, Message)]
+pub struct PushNotify {
+    #[prost(bytes = "vec", tag = "1")]
+    pub capability: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub call_id: Vec<u8>,
+}
+
+/// Attach a device's opaque routes to a journal. Signed with the journal read key.
+#[derive(Clone, PartialEq, Message)]
+pub struct NotifySet {
+    #[prost(bytes = "vec", tag = "1")]
+    pub log_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "2")]
+    pub slot: Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub alert: Vec<u8>,
+    #[prost(bytes = "vec", tag = "4")]
+    pub voip: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, Message)]
@@ -195,6 +242,12 @@ pub struct LogAppend {
     pub log_id: Vec<u8>,
     #[prost(bytes = "vec", tag = "2")]
     pub blob: Vec<u8>,
+    #[prost(bool, tag = "3")]
+    pub alert: bool,
+    #[prost(bytes = "vec", tag = "4")]
+    pub call_id: Vec<u8>,
+    #[prost(bytes = "vec", tag = "5")]
+    pub sender_slot: Vec<u8>,
 }
 
 /// MLS-коммит: принимается, только если для `epoch` коммита ещё нет (compare-and-swap).
@@ -235,7 +288,7 @@ pub struct LogWatch {
 pub struct Response {
     #[prost(uint64, tag = "1")]
     pub corr_id: u64,
-    #[prost(oneof = "response::Body", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18")]
+    #[prost(oneof = "response::Body", tags = "10, 11, 12, 13, 14, 15, 16, 17, 18, 19")]
     pub body: Option<response::Body>,
 }
 
@@ -262,6 +315,8 @@ pub mod response {
         PeerWelcome(PeerWelcome),
         #[prost(message, tag = "18")]
         NetSnapshotReply(NetSnapshotReply),
+        #[prost(message, tag = "19")]
+        PushRegistered(PushRegistered),
     }
 }
 
@@ -280,6 +335,8 @@ pub struct ErrorReply {
 pub struct Pong {
     #[prost(uint64, tag = "1")]
     pub time_ms: u64,
+    #[prost(bool, tag = "2")]
+    pub push_forwarding: bool,
 }
 
 #[derive(Clone, PartialEq, Message)]

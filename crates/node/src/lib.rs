@@ -14,6 +14,7 @@ pub mod store;
 mod hub;
 mod peers;
 mod presence;
+mod push;
 
 pub use config::Config;
 pub use identity::NodeIdentity;

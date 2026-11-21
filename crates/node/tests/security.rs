@@ -202,7 +202,8 @@ async fn stranger_cannot_take_over_queue_or_log() {
     )
     .await
     .unwrap();
-    let append = request::Body::LogAppend(LogAppend { log_id: log_id.clone(), blob: b"x".to_vec() });
+    let append =
+        request::Body::LogAppend(LogAppend { log_id: log_id.clone(), blob: b"x".to_vec(), ..Default::default() });
     assert_eq!(code(c.request(append.clone(), None).await.unwrap_err()), ErrorCode::Auth);
     assert_eq!(code(c.request(append.clone(), Some(&thief)).await.unwrap_err()), ErrorCode::Auth);
     c.request(append, Some(&write)).await.unwrap();
@@ -242,8 +243,9 @@ async fn signed_command_cannot_be_altered() {
     .await
     .unwrap();
 
-    let append =
-        |blob: &[u8]| Some(request::Body::LogAppend(LogAppend { log_id: log_id.clone(), blob: blob.to_vec() }));
+    let append = |blob: &[u8]| {
+        Some(request::Body::LogAppend(LogAppend { log_id: log_id.clone(), blob: blob.to_vec(), ..Default::default() }))
+    };
     let mut signed = Request { corr_id: 1000, auth_sig: vec![], body: append(b"honest") };
     signed.auth_sig = write.sign(&signed.signing_bytes(c.session_hash())).to_vec();
 

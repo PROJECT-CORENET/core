@@ -216,7 +216,7 @@ async fn new_log(c: &Client) -> TestLog {
 }
 
 fn append(log: &TestLog, blob: &[u8]) -> request::Body {
-    request::Body::LogAppend(LogAppend { log_id: log.id.clone(), blob: blob.to_vec() })
+    request::Body::LogAppend(LogAppend { log_id: log.id.clone(), blob: blob.to_vec(), ..Default::default() })
 }
 
 fn read(log: &TestLog, from: u64, limit: u32) -> request::Body {

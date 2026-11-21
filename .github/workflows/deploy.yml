@@ -94,6 +94,54 @@ jobs:
             out/${{ matrix.name }}.region
           retention-days: 7
 
+  # APNs credentials are available only to the dedicated gateway job.
+  push:
+    needs: identity
+    if: vars.CORE_PUSH_PORT != ''
+    runs-on: [self-hosted, proxy]
+    environment: push-apns
+    steps:
+      - name: Image tag
+        id: tag
+        run: |
+          tag="$TAG"
+          case "$tag" in sha-*) tag="sha-$(echo "${tag#sha-}" | cut -c1-7)";; esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "IMAGE=$(echo "$IMAGE_REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
+
+      - name: Start APNs gateway
+        env:
+          APNS_KEY_P8: ${{ secrets.APNS_KEY_P8 }}
+          APNS_KEY_ID: ${{ secrets.APNS_KEY_ID }}
+          APNS_TEAM_ID: ${{ secrets.APNS_TEAM_ID }}
+          CORE_PUSH_PORT: ${{ vars.CORE_PUSH_PORT }}
+          CORE_PUSH_GATEWAY: ${{ vars.CORE_PUSH_GATEWAY }}
+          CORE_PUBLIC_MAILBOX: 188.225.72.79:7445
+        run: |
+          set -euo pipefail
+          : "${APNS_KEY_P8:?Set APNS_KEY_P8}" "${APNS_KEY_ID:?Set APNS_KEY_ID}" "${APNS_TEAM_ID:?Set APNS_TEAM_ID}"
+          [[ "$CORE_PUSH_PORT" =~ ^[0-9]+$ ]] && ((CORE_PUSH_PORT > 0 && CORE_PUSH_PORT < 65536))
+          image="$IMAGE:${{ steps.tag.outputs.tag }}"
+          public="${CORE_PUBLIC_MAILBOX%:*}:$CORE_PUSH_PORT"
+          docker volume create core-push-data >/dev/null
+          address=$(docker run --rm -v core-push-data:/data -e CORE_PUBLIC_HOST="$public" "$image" info | sed -n 's/^address: //p')
+          if [ "$address" != "$CORE_PUSH_GATEWAY" ]; then
+            echo "Set CORE_PUSH_GATEWAY to $address and rerun."
+            exit 1
+          fi
+          printf '%s\n' "$APNS_KEY_P8" | docker run --rm -i --user root --entrypoint /bin/sh -v core-push-data:/data "$image" -ec '
+            umask 077
+            cat > /data/.apns-key.new
+            chown 10001 /data/.apns-key.new
+            mv -f /data/.apns-key.new /data/apns-key.p8
+          '
+          docker rm -f core-push >/dev/null 2>&1 || true
+          docker run -d --name core-push --restart unless-stopped \
+            -p "$CORE_PUSH_PORT:$INNER_PORT" -v core-push-data:/data \
+            -e CORE_PUBLIC_HOST="$public" -e CORE_NAME=CORE-Push \
+            -e CORE_PUSH_DB=/data/push.db -e APNS_KEY_FILE=/data/apns-key.p8 -e APNS_KEY_ID -e APNS_TEAM_ID \
+            "$image" run
+
   # 2. Запустить ноды: bootstrap — все остальные ноды сети.
   run:
     needs: identity
@@ -127,6 +175,8 @@ jobs:
           echo "🔗 ${{ matrix.name }} bootstrap: $boot"
 
       - name: Start node
+        env:
+          CORE_PUSH_GATEWAY: ${{ vars.CORE_PUSH_GATEWAY }}
         run: |
           port="${{ matrix.host }}"; port="${port##*:}"
           docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -137,6 +187,7 @@ jobs:
             -p "$port:$INNER_PORT" \
             -v "$VOLUME:/data" \
             -e RUST_LOG=info \
+            -e CORE_PUSH_GATEWAY \
             -e CORE_PUBLIC_HOST="${{ matrix.host }}" \
             -e CORE_NAME="${{ matrix.name }}" \
             -e CORE_REGION="${{ matrix.region }}" \

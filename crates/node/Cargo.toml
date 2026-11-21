@@ -11,6 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
+chacha20poly1305 = "0.10"
+p256 = { version = "0.13", features = ["ecdsa", "pem"] }
 clap.workspace = true
 core-crypto.workspace = true
 core-directory.workspace = true

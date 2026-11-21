@@ -211,7 +211,9 @@ async fn unsubscribe_stops_events() {
     )
     .await
     .unwrap();
-    let append = |b: &[u8]| request::Body::LogAppend(LogAppend { log_id: log_id.clone(), blob: b.to_vec() });
+    let append = |b: &[u8]| {
+        request::Body::LogAppend(LogAppend { log_id: log_id.clone(), blob: b.to_vec(), ..Default::default() })
+    };
 
     c.request(request::Body::LogWatch(LogWatch { log_id: log_id.clone(), from_offset: 0 }), Some(&read)).await.unwrap();
     c.request(append(b"1"), Some(&write)).await.unwrap();

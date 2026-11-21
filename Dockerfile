@@ -11,7 +11,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/core-node target/release/core-cli /out/
 
 FROM debian:bookworm-slim
-RUN useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin core \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 10001 --home-dir /data --shell /usr/sbin/nologin core \
     && mkdir -p /data && chown core /data
 COPY --from=build /out/core-node /out/core-cli /usr/local/bin/
 COPY docker/healthcheck.sh /usr/local/bin/core-healthcheck

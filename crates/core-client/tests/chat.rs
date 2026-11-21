@@ -145,6 +145,7 @@ async fn invite_chat_files_and_group() {
         width: 800,
         height: 600,
         spoiler: true,
+        spoiler_hearts: true,
         ..Default::default()
     };
     alice.send_attachment(&a_chat, att, "Смотри").await.unwrap();
@@ -158,6 +159,7 @@ async fn invite_chat_files_and_group() {
     assert_eq!((a.kind.as_str(), a.w, a.h, a.size), ("photo", 800, 600, 300_000));
     assert_eq!(a.thumb.as_deref(), Some(&[1u8, 2, 3][..]));
     assert!(a.spoiler, "spoiler flag survives MLS");
+    assert!(a.spoiler_hearts, "heart spoiler style survives MLS");
     assert_eq!(std::fs::read(m.local_path.unwrap()).unwrap(), data);
     assert!(bob.storage_usage().unwrap().photos >= 300_000);
 
@@ -518,6 +520,27 @@ async fn retry_failed_message() {
     alice.retry_message(&failed.id).await.unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(texts(&bob, &b_chat), ["Ты тут?"]);
+    rt.shutdown_background();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_message_handoff_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let identity = NodeIdentity::generate();
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let db = dir.path().join("node.db");
+    let (node, rt) = restartable_node(&identity, &db, port);
+    let alice = client(&dir, "Alice", &node).await;
+    let bob = client(&dir, "Bob", &node).await;
+    let (a_chat, link) = alice.create_chat(None).await.unwrap();
+    let b_chat = bob.accept_invite(&link).await.unwrap();
+    eventually("bob joins", || alice.chat(&a_chat).unwrap().title == "Bob").await;
+
+    let id = "a1234567890123456789012345678901";
+    alice.accept_shared(&a_chat, id.into(), "Shared link", None).await.unwrap();
+    alice.accept_shared(&a_chat, id.into(), "Shared link", None).await.unwrap();
+    eventually("bob receives share", || texts(&bob, &b_chat) == ["Shared link"]).await;
+    assert_eq!(alice.messages(&a_chat, 10, None).unwrap().iter().filter(|m| m.id == id).count(), 1);
     rt.shutdown_background();
 }
 

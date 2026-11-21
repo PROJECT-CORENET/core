@@ -164,6 +164,11 @@ CREATE INDEX IF NOT EXISTS calls_ts ON calls (ts);
 CREATE TABLE IF NOT EXISTS mirrors (
     chat_id TEXT PRIMARY KEY, node TEXT NOT NULL, log_id BLOB NOT NULL, write_sk BLOB NOT NULL,
     read_sk BLOB NOT NULL, read_offset INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS outbox_retry (
+    msg_id TEXT PRIMARY KEY, failures INTEGER NOT NULL, retry_at INTEGER NOT NULL);
+CREATE TRIGGER IF NOT EXISTS delete_outbox_retry AFTER DELETE ON messages BEGIN
+    DELETE FROM outbox_retry WHERE msg_id = OLD.id;
+END;
 ";
 
 const CALL_COLS: &str = "id, chat_id, initiator, video, ts, room, key, joined_ms, ended_ms, result, members";
@@ -603,8 +608,31 @@ impl Store {
             c.execute("DELETE FROM own_offsets WHERE chat_id = ?", [id])?;
             c.execute("DELETE FROM messages WHERE chat_id = ?", [id])?;
             c.execute("DELETE FROM mirrors WHERE chat_id = ?", [id])?;
+            c.execute("DELETE FROM kv WHERE k = ?", [format!("draft:{id}")])?;
             Ok(())
         })
+    }
+
+    pub fn set_draft(&self, id: &str, text: &str) -> Result<()> {
+        let key = format!("draft:{id}");
+        if text.is_empty() {
+            return self.delete(&key);
+        }
+        self.with(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO kv (k, v) SELECT ?1, ?2 WHERE EXISTS (SELECT 1 FROM chats WHERE id = ?3)",
+                params![key, text.as_bytes(), id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn drafts(&self) -> Result<std::collections::HashMap<String, String>> {
+        Ok(self
+            .get_prefix("draft:")?
+            .into_iter()
+            .filter_map(|(k, v)| String::from_utf8(v).ok().map(|text| (k[6..].to_owned(), text)))
+            .collect())
     }
 
     // ── участники ──
@@ -652,6 +680,16 @@ impl Store {
                 "INSERT OR REPLACE INTO mirrors (chat_id, node, log_id, write_sk, read_sk, read_offset) \
                  VALUES (?, ?, ?, ?, ?, ?)",
                 params![chat_id, m.node, m.log_id, m.write_sk, m.read_sk, m.read_offset as i64],
+            )
+            .map(drop)
+        })
+    }
+
+    pub fn advance_mirror(&self, chat_id: &str, log_id: &[u8], next: u64) -> Result<()> {
+        self.with(|c| {
+            c.execute(
+                "UPDATE mirrors SET read_offset = MAX(read_offset, ?3) WHERE chat_id = ?1 AND log_id = ?2",
+                params![chat_id, log_id, next as i64],
             )
             .map(drop)
         })
@@ -840,6 +878,29 @@ impl Store {
         self.with(|c| c.execute("UPDATE messages SET status = ? WHERE id = ?", params![status as i64, id]).map(drop))
     }
 
+    pub fn finish_delivery(&self, id: &str, sent: bool, now: u64) -> Result<()> {
+        self.with(|c| {
+            let tx = c.unchecked_transaction()?;
+            let status = if sent { MessageStatus::Sent } else { MessageStatus::Failed };
+            let changed = tx.execute(
+                "UPDATE messages SET status = ?1 WHERE id = ?2 AND status IN (0, 3)",
+                params![status as i64, id],
+            )?;
+            if changed != 0 && !sent {
+                tx.execute(
+                    "INSERT INTO outbox_retry (msg_id, failures, retry_at) VALUES (?1, 1, ?2 + 2000)
+                     ON CONFLICT(msg_id) DO UPDATE SET
+                        retry_at = ?2 + MIN(60000, 1000 << MIN(6, failures + 1)),
+                        failures = MIN(6, failures + 1)",
+                    params![id, now as i64],
+                )?;
+            } else {
+                tx.execute("DELETE FROM outbox_retry WHERE msg_id = ?", [id])?;
+            }
+            tx.commit()
+        })
+    }
+
     /// MLS authenticates `sender`; scope by both author and chat so a member cannot edit someone else's message.
     /// Equal-time edits converge by edit id, independently of arrival order on different devices.
     pub fn edit_message(
@@ -1007,13 +1068,16 @@ impl Store {
     }
 
     /// Свои неотправленные сообщения за последние сутки (ошибка или «отправляется» после перезапуска), старые первыми.
-    pub fn unsent_outgoing(&self) -> Result<Vec<String>> {
+    pub fn unsent_outgoing(&self) -> Result<Vec<(String, String, u64)>> {
         let since = crate::now_ms().saturating_sub(24 * 60 * 60 * 1000) as i64;
         self.with(|c| {
             let mut stmt = c.prepare(
-                "SELECT id FROM messages WHERE outgoing = 1 AND status IN (0, 3) AND ts >= ? ORDER BY ts ASC, seq ASC",
+                "SELECT m.id, m.chat_id, COALESCE(r.retry_at, 0)
+                 FROM messages m LEFT JOIN outbox_retry r ON r.msg_id = m.id
+                 WHERE m.outgoing = 1 AND m.status IN (0, 3) AND m.ts >= ?
+                 ORDER BY m.seq ASC",
             )?;
-            let rows = stmt.query_map([since], |r| r.get(0))?;
+            let rows = stmt.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? as u64)))?;
             rows.collect()
         })
     }
@@ -1038,6 +1102,69 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_survives_reopen_and_is_removed_with_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drafts.db");
+        let key = [7; 32];
+        let chat = ChatRow {
+            id: "c".into(),
+            group_id: None,
+            title: "Draft test".into(),
+            custom_title: false,
+            node: String::new(),
+            log_id: vec![],
+            write_sk: vec![],
+            read_sk: vec![],
+            read_offset: 0,
+            state: ChatState::Active,
+            created_ms: 1,
+            last_ms: 1,
+            unread: 0,
+            muted: false,
+            pinned: false,
+        };
+        let store = Store::open(&path, Some(&key)).unwrap();
+        store.insert_chat(&chat).unwrap();
+        store.set_draft("c", "Сохранить **разметку** 🙂").unwrap();
+        store.set_draft("missing", "orphan").unwrap();
+        drop(store);
+
+        let store = Store::open(&path, Some(&key)).unwrap();
+        let drafts = store.drafts().unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert_eq!(drafts["c"], "Сохранить **разметку** 🙂");
+        store.set_draft("c", "").unwrap();
+        assert!(store.drafts().unwrap().is_empty());
+        store.set_draft("c", "another draft").unwrap();
+        store.delete_chat("c").unwrap();
+        assert!(store.drafts().unwrap().is_empty());
+    }
+
+    #[test]
+    fn outbox_backoff_survives_reopen_and_grows_to_one_minute() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.db");
+        let store = Store::open(&path, None).unwrap();
+        let now = crate::now_ms();
+        let mut row = message("queued", None);
+        row.ts = now;
+        row.status = MessageStatus::Sending;
+        store.insert_message(&row).unwrap();
+        store.finish_delivery("queued", false, now).unwrap();
+        assert_eq!(store.unsent_outgoing().unwrap()[0].2, now + 2000);
+        drop(store);
+
+        let store = Store::open(&path, None).unwrap();
+        assert_eq!(store.unsent_outgoing().unwrap()[0].2, now + 2000);
+        for delay in [4000, 8000, 16000, 32000, 60000, 60000] {
+            store.finish_delivery("queued", false, now).unwrap();
+            assert_eq!(store.unsent_outgoing().unwrap()[0].2, now + delay);
+        }
+        store.finish_delivery("queued", true, now).unwrap();
+        assert!(store.unsent_outgoing().unwrap().is_empty());
+    }
 
     fn message(id: &str, path: Option<&str>) -> MessageRow {
         MessageRow {

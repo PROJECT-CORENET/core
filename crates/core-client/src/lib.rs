@@ -25,8 +25,8 @@ use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 use core_crypto::{random_bytes, Ed25519Key};
 use core_net::{Client as NetClient, NetError, NodeAddr};
 use core_proto::msg::{
-    event, request, response, Event, LogAppend, LogCommit, LogEntry, LogNew, LogWatch, QueueAck, QueueDel, QueueNew,
-    QueueSend, QueueSub,
+    event, request, response, Event, LogAppend, LogCommit, LogEntry, LogNew, LogRead, LogWatch, QueueAck, QueueDel,
+    QueueNew, QueueSend, QueueSub,
 };
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
@@ -230,6 +230,7 @@ pub struct OutgoingAttachment {
     pub waveform: Option<Vec<u8>>,
     /// Показать получателю размытым до нажатия.
     pub spoiler: bool,
+    pub spoiler_hearts: bool,
     /// Пересылка: имя автора оригинала.
     pub forwarded_from: Option<String>,
     /// Пересылка: ключ автора оригинала.
@@ -266,7 +267,7 @@ impl MediaSettings {
     fn auto_download(&self, a: &AttachmentRef) -> bool {
         let kind = match a.kind.as_str() {
             "photo" => self.auto_photos,
-            "video" => self.auto_videos,
+            "video" | "video_note" => self.auto_videos,
             "voice" => self.auto_voice,
             _ => self.auto_files,
         };
@@ -305,6 +306,7 @@ struct Inner {
     me: String,
     engine: tokio::sync::Mutex<Engine>,
     conns: Mutex<HashMap<String, Arc<NetClient>>>,
+    push_nodes: Mutex<std::collections::HashSet<String>>,
     connecting: tokio::sync::Mutex<()>,
     events: mpsc::UnboundedSender<(String, Event)>,
     listener: RwLock<Option<Arc<dyn Listener>>>,
@@ -325,6 +327,23 @@ struct Inner {
     /// Рантайм, в котором открыт клиент: синхронные вызовы из приложения (не из tokio) запускают фон через него.
     rt: tokio::runtime::Handle,
     calls: calls::Calls,
+}
+
+struct InFlight<'a> {
+    ids: &'a Mutex<std::collections::HashSet<String>>,
+    id: &'a str,
+}
+
+impl<'a> InFlight<'a> {
+    fn claim(ids: &'a Mutex<std::collections::HashSet<String>>, id: &'a str) -> Option<Self> {
+        ids.lock().unwrap().insert(id.to_owned()).then(|| Self { ids, id })
+    }
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.ids.lock().unwrap().remove(self.id);
+    }
 }
 
 /// Всё, что меняет состояние MLS, — строго по очереди под этим замком.
@@ -439,6 +458,7 @@ impl Client {
             me,
             engine: tokio::sync::Mutex::new(Engine { provider, signer, credential }),
             conns: Mutex::default(),
+            push_nodes: Mutex::default(),
             connecting: tokio::sync::Mutex::new(()),
             events: tx,
             listener: RwLock::new(None),
@@ -456,6 +476,8 @@ impl Client {
         });
         tokio::spawn(event_worker(Arc::downgrade(&inner), rx));
         tokio::spawn(reconnect_loop(Arc::downgrade(&inner)));
+        tokio::spawn(retry_loop(Arc::downgrade(&inner)));
+        tokio::spawn(mirror_read_loop(Arc::downgrade(&inner)));
         let client = Self { inner };
         {
             // Догрузка пропущенного: пока приложение было закрыто, загрузка прервалась или файл
@@ -465,7 +487,6 @@ impl Client {
             tokio::spawn(async move {
                 tokio::time::sleep(Duration::from_secs(3)).await;
                 if let Some(inner) = weak.upgrade() {
-                    inner.retry_unsent().await;
                     inner.resume_downloads().await;
                 }
             });
@@ -479,6 +500,29 @@ impl Client {
 
     pub fn set_listener(&self, listener: Arc<dyn Listener>) {
         *self.inner.listener.write().unwrap() = Some(listener);
+    }
+
+    pub async fn register_push(
+        &self,
+        gateway: &str,
+        sandbox: bool,
+        alert: Option<Vec<u8>>,
+        voip: Option<Vec<u8>>,
+    ) -> Result<()> {
+        let inner = &self.inner;
+        let gateway = inner.conn(gateway).await?;
+        let mut first_error = None;
+        for chat in inner.store.chats()?.into_iter().filter(|chat| chat.state == ChatState::Active) {
+            if inner.saved_id().as_deref() == Some(&chat.id) {
+                continue;
+            }
+            if let Err(error) =
+                inner.register_log_push(&gateway, &chat, sandbox, alert.as_deref(), voip.as_deref()).await
+            {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
     }
 
     pub fn set_default_node(&self, node: &str) {
@@ -753,6 +797,14 @@ impl Client {
         Ok(())
     }
 
+    pub fn drafts(&self) -> Result<std::collections::HashMap<String, String>> {
+        Ok(self.inner.store.drafts()?)
+    }
+
+    pub fn set_draft(&self, chat_id: &str, text: &str) -> Result<()> {
+        Ok(self.inner.store.set_draft(chat_id, text)?)
+    }
+
     // ── сообщения ──
 
     /// `link` — превью ссылки, подготовленное на устройстве отправителя (необязательно).
@@ -792,6 +844,48 @@ impl Client {
     /// Отправить файл: копия кладётся в медиатеку, шифруется и выгружается кусками в отдельный журнал.
     pub async fn send_attachment(&self, chat_id: &str, att: OutgoingAttachment, caption: &str) -> Result<String> {
         let id = new_id();
+        self.send_attachment_with_id(chat_id, att, caption, id).await
+    }
+
+    /// Stable id allows the share queue to retry its hand-off after the app was terminated.
+    pub async fn accept_shared(
+        &self,
+        chat_id: &str,
+        id: String,
+        text: &str,
+        attachment: Option<OutgoingAttachment>,
+    ) -> Result<()> {
+        if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Error::Other("invalid shared message id".into()));
+        }
+        if let Some(message) = self.inner.store.message(&id)? {
+            return if message.chat_id == chat_id && message.outgoing {
+                Ok(())
+            } else {
+                Err(Error::Other("shared message id already in use".into()))
+            };
+        }
+        let result = match attachment {
+            Some(attachment) => self.send_attachment_with_id(chat_id, attachment, text, id.clone()).await,
+            None if !text.trim().is_empty() => {
+                self.inner.send_message(chat_id, text.trim().into(), None, None, Some(id.clone()), None, None).await
+            }
+            None => return Err(Error::Other("empty shared message".into())),
+        };
+        // Once persisted, the normal outbox owns delivery, even if the first attempt failed.
+        if self.inner.store.message(&id)?.is_some_and(|m| m.chat_id == chat_id && m.outgoing) {
+            return Ok(());
+        }
+        result.map(drop)
+    }
+
+    async fn send_attachment_with_id(
+        &self,
+        chat_id: &str,
+        att: OutgoingAttachment,
+        caption: &str,
+        id: String,
+    ) -> Result<String> {
         let ext = Path::new(&att.name).extension().and_then(|e| e.to_str()).unwrap_or("bin");
         let local = self.inner.dir.join("media").join(format!("{id}.{ext}"));
         std::fs::copy(&att.path, &local).map_err(|e| Error::Other(format!("read file: {e}")))?;
@@ -816,6 +910,7 @@ impl Client {
             duration_ms: att.duration_ms,
             wave: att.waveform,
             spoiler: att.spoiler,
+            spoiler_hearts: att.spoiler && att.spoiler_hearts,
             ..Default::default()
         };
         self.inner
@@ -970,7 +1065,7 @@ impl Client {
             let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             match kind.as_str() {
                 "photo" => u.photos += size,
-                "video" => u.videos += size,
+                "video" | "video_note" => u.videos += size,
                 "voice" => u.voice += size,
                 _ => u.files += size,
             }
@@ -985,7 +1080,11 @@ impl Client {
     pub fn clear_media(&self, kinds: &[String]) -> Result<u64> {
         let mut freed = 0;
         for (_, kind, path) in self.inner.store.media_files()? {
-            let k = if matches!(kind.as_str(), "photo" | "video" | "voice") { kind.as_str() } else { "file" };
+            let k = match kind.as_str() {
+                "video_note" => "video",
+                "photo" | "video" | "voice" => kind.as_str(),
+                _ => "file",
+            };
             if kinds.is_empty() || kinds.iter().any(|x| x == k) {
                 freed += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
                 let _ = std::fs::remove_file(&path);
@@ -1227,6 +1326,10 @@ impl Inner {
     async fn failover(self: &Arc<Self>, chat: &ChatRow) -> Result<()> {
         let Some(mirror) = self.store.mirror(&chat.id)? else { return Ok(()) };
         let conn = self.conn(&mirror.node).await?;
+        let _engine = self.engine.lock().await;
+        if self.store.mirror(&chat.id)?.is_none_or(|current| current.log_id != mirror.log_id) {
+            return Ok(());
+        }
         if self.store.swap_to_mirror(&chat.id)?.is_none() {
             return Ok(());
         }
@@ -1234,6 +1337,56 @@ impl Inner {
         self.watch_chat(&conn, &moved).await?;
         warn!("🛟 chat {} moved from {} to backup {}", chat.id, short(&chat.node), short(&mirror.node));
         self.notify(None);
+        Ok(())
+    }
+
+    async fn read_mirror(self: &Arc<Self>, chat_id: &str, mirror: MirrorRow) -> Result<()> {
+        let conn = self.conn(&mirror.node).await?;
+        let read = key(&mirror.read_sk);
+        let response = conn
+            .request(
+                request::Body::LogRead(LogRead {
+                    log_id: mirror.log_id.clone(),
+                    from_offset: mirror.read_offset,
+                    limit: 32,
+                }),
+                Some(&read),
+            )
+            .await?;
+        let entries = match response {
+            response::Body::LogEntries(entries) => entries.entries,
+            other => return Err(refused(other)),
+        };
+        for entry in entries {
+            let engine = self.engine.lock().await;
+            let Some(chat) = self.store.chat(chat_id)?.filter(|c| c.state == ChatState::Active) else { break };
+            let Some(current) = self.store.mirror(chat_id)?.filter(|m| m.log_id == mirror.log_id) else { break };
+            if entry.offset < current.read_offset {
+                continue;
+            }
+            let mut group = engine.group(&chat)?;
+            if let Some(msg) = MlsMessageIn::tls_deserialize_exact(&entry.blob)
+                .ok()
+                .and_then(|msg| msg.try_into_protocol_message().ok())
+            {
+                // Обновление состава проводит только активный журнал. Будущую эпоху дочитаем позже.
+                if msg.epoch() > group.epoch() || (msg.is_handshake_message() && msg.epoch() == group.epoch()) {
+                    break;
+                }
+                if !msg.is_handshake_message() {
+                    if let Ok(processed) = group.process_message(&engine.provider, msg) {
+                        let sender = String::from_utf8_lossy(processed.credential().serialized_content()).into_owned();
+                        if let ProcessedMessageContent::ApplicationMessage(app) = processed.into_content() {
+                            engine.save(&self.store)?;
+                            if let Ok(payload) = serde_json::from_slice::<Payload>(&app.into_bytes()) {
+                                self.apply_payload(&chat, &sender, payload, &engine).await?;
+                            }
+                        }
+                    }
+                }
+            }
+            self.store.advance_mirror(chat_id, &mirror.log_id, entry.offset + 1)?;
+        }
         Ok(())
     }
 
@@ -1251,6 +1404,12 @@ impl Inner {
         let (client, mut events) =
             tokio::time::timeout(REQUEST_TIMEOUT, NetClient::connect(&addr)).await.map_err(|_| NetError::Timeout)??;
         let client = Arc::new(client);
+        if matches!(
+            tokio::time::timeout(Duration::from_secs(1), client.request(request::Body::Ping(Default::default()), None)).await,
+            Ok(Ok(response::Body::Pong(pong))) if pong.push_forwarding
+        ) {
+            self.push_nodes.lock().unwrap().insert(node.to_owned());
+        }
         self.conns.lock().unwrap().insert(node.to_string(), client.clone());
         debug!("🔌 connected to {}", short(node));
 
@@ -1266,6 +1425,7 @@ impl Inner {
                 let mut conns = inner.conns.lock().unwrap();
                 if conns.get(&node_s).is_some_and(|c| Arc::ptr_eq(c, &me)) {
                     conns.remove(&node_s);
+                    inner.push_nodes.lock().unwrap().remove(&node_s);
                 }
                 debug!("🔌 disconnected from {}", short(&node_s));
             }
@@ -1296,6 +1456,46 @@ impl Inner {
         expect_done(conn.request(body, Some(&key(&chat.read_sk))).await?)
     }
 
+    fn push_slot(&self, log: &[u8], domain: &[u8]) -> Vec<u8> {
+        core_crypto::sha256(&[domain, self.device_id().as_bytes(), log].concat())[..16].to_vec()
+    }
+
+    async fn register_log_push(
+        self: &Arc<Self>,
+        gateway: &NetClient,
+        chat: &ChatRow,
+        sandbox: bool,
+        alert: Option<&[u8]>,
+        voip: Option<&[u8]>,
+    ) -> Result<()> {
+        use core_proto::msg::{NotifySet, PushRegister};
+        let conn = self.conn(&chat.node).await?;
+        if !self.push_nodes.lock().unwrap().contains(&chat.node) {
+            return Ok(());
+        }
+        let scope = self.push_slot(&chat.log_id, b"CORE/Push/scope");
+        let register = |token: Option<&[u8]>, voip| {
+            let token = token.map(<[u8]>::to_vec);
+            let scope = scope.clone();
+            async move {
+                let Some(token) = token else { return Ok(vec![]) };
+                let request = request::Body::PushRegister(PushRegister { token, sandbox, voip, scope });
+                match gateway.request(request, None).await? {
+                    response::Body::PushRegistered(registered) => Ok(registered.capability),
+                    other => Err(refused(other)),
+                }
+            }
+        };
+        let (alert, voip) = tokio::try_join!(register(alert.filter(|_| !chat.muted), false), register(voip, true))?;
+        let route = NotifySet {
+            log_id: chat.log_id.clone(),
+            slot: self.push_slot(&chat.log_id, b"CORE/Push/slot"),
+            alert,
+            voip,
+        };
+        expect_done(conn.request(request::Body::NotifySet(route), Some(&key(&chat.read_sk))).await?)
+    }
+
     /// Зашифровать и положить прикладное сообщение в журнал чата.
     async fn send_payload(self: &Arc<Self>, chat: &ChatRow, payload: &Payload) -> Result<u64> {
         let bytes = serde_json::to_vec(payload).unwrap();
@@ -1309,8 +1509,17 @@ impl Inner {
         engine.save(&self.store)?;
         let blob = out.tls_serialize_detached().map_err(mls)?;
         let write = key(&chat.write_sk);
-        let resp =
-            conn.request(request::Body::LogAppend(LogAppend { log_id: chat.log_id.clone(), blob }), Some(&write));
+        let mut append = LogAppend { log_id: chat.log_id.clone(), blob, ..Default::default() };
+        if self.push_nodes.lock().unwrap().contains(&chat.node) {
+            append.alert = matches!(payload, Payload::Message { .. });
+            if let Payload::Call { id, op: payload::CallOp::Ring { .. } } = payload {
+                append.call_id = hex::decode(id).unwrap_or_default();
+            }
+            if append.alert || !append.call_id.is_empty() {
+                append.sender_slot = self.push_slot(&chat.log_id, b"CORE/Push/slot");
+            }
+        }
+        let resp = conn.request(request::Body::LogAppend(append), Some(&write));
         match tokio::time::timeout(REQUEST_TIMEOUT, resp).await.map_err(|_| NetError::Timeout)?? {
             response::Body::LogAppended(a) => {
                 self.store.add_own_offset(&chat.id, a.offset)?;
@@ -1358,33 +1567,37 @@ impl Inner {
             edited_ms: 0,
             edit_id: String::new(),
         };
-        self.store.insert_message(&row)?;
-        self.store.touch_chat(chat_id, ts, 0)?;
+        if !self.store.insert_message_touch(&row, ts, 0)? {
+            return Err(Error::Other("message id already in use".into()));
+        }
         self.notify(Some(chat_id.into()));
-        self.deliver(&chat, row).await.map(|_| id)
+        self.deliver(&chat, &id).await.map(|_| id)
     }
 
     /// Выгрузить вложение (если ещё не выгружено) и отправить сообщение в чат; статус — «отправлено» или «ошибка».
     /// Повтор безопасен: получатели отбрасывают дубликаты по id.
-    async fn deliver(self: &Arc<Self>, chat: &ChatRow, row: MessageRow) -> Result<()> {
-        let id = row.id.clone();
-        if !self.sending.lock().unwrap().insert(id.clone()) {
-            return Err(Error::Other("already sending".into()));
+    async fn deliver(self: &Arc<Self>, chat: &ChatRow, id: &str) -> Result<()> {
+        let _claim = InFlight::claim(&self.sending, id).ok_or(Error::Other("already sending".into()))?;
+        let row = self.store.message(id)?.ok_or(Error::Other("message not found".into()))?;
+        if matches!(row.status, MessageStatus::Sent | MessageStatus::Read) {
+            return Ok(());
         }
+        self.store.set_status(id, MessageStatus::Sending)?;
+        self.notify(Some(chat.id.clone()));
         let local = row.file_path.clone();
         let result = async {
             let att = match row.attachment {
                 Some(mut a) if a.key.is_empty() => {
                     let path = local.as_deref().ok_or(Error::Other("attachment file is gone".into()))?;
                     let conn = self.conn(&chat.node).await?;
-                    media::upload(&conn, &chat.node, Path::new(path), &mut a, Some(&id)).await?;
-                    self.store.set_attachment(&id, &a)?;
+                    media::upload(&conn, &chat.node, Path::new(path), &mut a, Some(id)).await?;
+                    self.store.set_attachment(id, &a)?;
                     Some(a)
                 }
                 other => other,
             };
             let payload = Payload::Message {
-                id: id.clone(),
+                id: id.to_owned(),
                 ts: row.ts,
                 text: row.text,
                 att: att.map(Box::new),
@@ -1396,10 +1609,8 @@ impl Inner {
             self.send_payload(chat, &payload).await
         }
         .await;
-        self.sending.lock().unwrap().remove(&id);
 
-        let status = if result.is_ok() { MessageStatus::Sent } else { MessageStatus::Failed };
-        self.store.set_status(&id, status)?;
+        self.store.finish_delivery(id, result.is_ok(), now_ms())?;
         if let Err(e) = &result {
             warn!("⚠️ message {id} not sent: {e}");
         } else if local.is_some() {
@@ -1419,23 +1630,26 @@ impl Inner {
         if chat.state != ChatState::Active {
             return Err(Error::NotReady);
         }
-        self.store.set_status(message_id, MessageStatus::Sending)?;
-        self.notify(Some(chat.id.clone()));
         info!("🔁 retrying message {message_id}");
-        self.deliver(&chat, row).await
+        self.deliver(&chat, message_id).await
     }
 
     /// Автоповтор: всё неотправленное (ошибки и «зависшие» после перезапуска) — по порядку.
     async fn retry_unsent(self: &Arc<Self>) {
         let Ok(ids) = self.store.unsent_outgoing() else { return };
-        for id in ids {
-            if self.sending.lock().unwrap().contains(&id) {
+        let now = now_ms();
+        let mut waiting = std::collections::HashSet::new();
+        for (id, chat_id, retry_at) in ids {
+            if waiting.contains(&chat_id) {
                 continue;
             }
-            // Нода недоступна — остальные тоже не уйдут, ждём следующего раза.
+            if retry_at > now || self.sending.lock().unwrap().contains(&id) {
+                waiting.insert(chat_id);
+                continue;
+            }
             if let Err(e) = self.retry(&id).await {
                 debug!("retry of {id} failed: {e}");
-                break;
+                waiting.insert(chat_id);
             }
         }
     }
@@ -1519,14 +1733,13 @@ impl Inner {
     }
 
     async fn download(self: &Arc<Self>, message_id: &str) -> Result<String> {
+        let _claim =
+            InFlight::claim(&self.downloading, message_id).ok_or(Error::Other("already downloading".into()))?;
         let m = self.store.message(message_id)?.ok_or(Error::Other("message not found".into()))?;
         if let Some(p) = m.file_path.as_ref().filter(|p| Path::new(p).exists()) {
             return Ok(p.clone());
         }
         let a = m.attachment.ok_or(Error::Other("no attachment".into()))?;
-        if !self.downloading.lock().unwrap().insert(message_id.to_string()) {
-            return Err(Error::Other("already downloading".into()));
-        }
         let result = async {
             let conn = self.conn(&a.node).await?;
             let ext = Path::new(&a.name).extension().and_then(|e| e.to_str()).unwrap_or("bin");
@@ -1538,7 +1751,6 @@ impl Inner {
             Ok(path)
         }
         .await;
-        self.downloading.lock().unwrap().remove(message_id);
         self.notify(Some(m.chat_id));
         result
     }
@@ -1707,7 +1919,9 @@ impl Inner {
 
     async fn process_entry(self: &Arc<Self>, engine: &mut Engine, chat: &ChatRow, entry: LogEntry) -> Result<()> {
         // Читаем текущее смещение заново: событие могло прийти повторно после переподписки.
-        let chat = self.store.chat(&chat.id)?.ok_or(Error::NoChat)?;
+        let Some(chat) = self.store.chat(&chat.id)?.filter(|current| current.log_id == chat.log_id) else {
+            return Ok(());
+        };
         if entry.offset < chat.read_offset {
             return Ok(());
         }
@@ -2004,7 +2218,6 @@ async fn reconnect_loop(inner: std::sync::Weak<Inner>) {
             if reconnected {
                 let inner = inner.clone();
                 tokio::spawn(async move {
-                    inner.retry_unsent().await;
                     inner.resume_downloads().await;
                 });
             }
@@ -2031,6 +2244,28 @@ async fn reconnect_loop(inner: std::sync::Weak<Inner>) {
             }
         }
         tokio::time::sleep(RECONNECT_EVERY).await;
+    }
+}
+
+async fn retry_loop(inner: std::sync::Weak<Inner>) {
+    loop {
+        tokio::time::sleep(RECONNECT_EVERY).await;
+        let Some(inner) = inner.upgrade() else { return };
+        inner.retry_unsent().await;
+    }
+}
+
+async fn mirror_read_loop(inner: std::sync::Weak<Inner>) {
+    loop {
+        tokio::time::sleep(RECONNECT_EVERY).await;
+        let Some(inner) = inner.upgrade() else { return };
+        for chat in inner.store.chats().unwrap_or_default().into_iter().filter(|c| c.state == ChatState::Active) {
+            if let Ok(Some(mirror)) = inner.store.mirror(&chat.id) {
+                if let Err(error) = inner.read_mirror(&chat.id, mirror).await {
+                    debug!("mirror read for {} failed: {error}", chat.id);
+                }
+            }
+        }
     }
 }
 

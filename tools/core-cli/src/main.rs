@@ -127,7 +127,11 @@ async fn demo(addr: &NodeAddr) -> anyhow::Result<()> {
     for text in ["первое", "второе"] {
         client
             .request(
-                request::Body::LogAppend(LogAppend { log_id: log_id.clone(), blob: text.as_bytes().to_vec() }),
+                request::Body::LogAppend(LogAppend {
+                    log_id: log_id.clone(),
+                    blob: text.as_bytes().to_vec(),
+                    ..Default::default()
+                }),
                 Some(&write),
             )
             .await?;

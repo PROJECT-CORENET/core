@@ -215,6 +215,8 @@ pub struct AttachmentRef {
     /// Фото/видео под спойлером: размыто, пока получатель не нажмёт.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub spoiler: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub spoiler_hearts: bool,
 }
 
 /// Карточка ссылки: заголовок, описание и крошечная картинка.

@@ -43,6 +43,15 @@ CREATE TABLE IF NOT EXISTS logs (
     max_epoch      INTEGER
 );
 
+CREATE TABLE IF NOT EXISTS log_notifications (
+    log_id BLOB NOT NULL REFERENCES logs(log_id) ON DELETE CASCADE,
+    slot BLOB NOT NULL,
+    alert BLOB NOT NULL,
+    voip BLOB NOT NULL,
+    expires INTEGER NOT NULL,
+    PRIMARY KEY (log_id, slot)
+);
+
 CREATE TABLE IF NOT EXISTS log_entries (
     log_id      BLOB NOT NULL REFERENCES logs(log_id) ON DELETE CASCADE,
     pos         INTEGER NOT NULL,
@@ -259,6 +268,44 @@ impl Store {
             .optional()?)
     }
 
+    pub fn notify_set(&self, route: &core_proto::msg::NotifySet, now: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM log_notifications WHERE log_id = ? AND expires <= ?",
+            params![route.log_id, now as i64],
+        )?;
+        if route.alert.is_empty() && route.voip.is_empty() {
+            conn.execute(
+                "DELETE FROM log_notifications WHERE log_id = ? AND slot = ?",
+                params![route.log_id, route.slot],
+            )?;
+            return Ok(());
+        }
+        let updated = conn.execute(
+            "INSERT INTO log_notifications (log_id, slot, alert, voip, expires)
+             SELECT ?1, ?2, ?3, ?4, ?5
+             WHERE EXISTS (SELECT 1 FROM log_notifications WHERE log_id = ?1 AND slot = ?2)
+                OR (SELECT COUNT(*) FROM log_notifications WHERE log_id = ?1) < 128
+             ON CONFLICT(log_id, slot) DO UPDATE SET alert=excluded.alert, voip=excluded.voip, expires=excluded.expires",
+             params![route.log_id, route.slot, route.alert, route.voip, now as i64 + 30 * 24 * 60 * 60 * 1000],
+        )?;
+        if updated == 0 {
+            return Err(StoreError::Quota);
+        }
+        Ok(())
+    }
+
+    pub fn notify_targets(&self, log: &[u8], sender: &[u8], voip: bool, now: u64) -> Result<Vec<Vec<u8>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT CASE WHEN ?1 THEN voip ELSE alert END FROM log_notifications WHERE log_id = ?2 AND slot != ?3 AND expires > ?4",
+        )?;
+        let targets = stmt
+            .query_map(params![voip, log, sender, now as i64], |row| row.get::<_, Vec<u8>>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(targets.into_iter().filter(|entry| !entry.is_empty()).collect())
+    }
+
     pub fn log_append(&self, log_id: &[u8], blob: &[u8], now: u64) -> Result<LogEntry> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -378,6 +425,31 @@ mod tests {
     use super::*;
 
     const PK: &[u8] = &[1; 32];
+
+    #[test]
+    fn log_push_routes_skip_sender_and_clear_independently() {
+        use core_proto::msg::NotifySet;
+        let s = Store::open_in_memory().unwrap();
+        let log_id = vec![5; 32];
+        s.log_new(&log_id, PK, PK, 1).unwrap();
+        let mut sender =
+            NotifySet { log_id: log_id.clone(), slot: vec![1; 16], alert: vec![11; 32], voip: vec![12; 32] };
+        let mut receiver =
+            NotifySet { log_id: log_id.clone(), slot: vec![2; 16], alert: vec![21; 32], voip: vec![22; 32] };
+        s.notify_set(&sender, 1).unwrap();
+        s.notify_set(&receiver, 1).unwrap();
+        assert_eq!(s.notify_targets(&log_id, &sender.slot, false, 2).unwrap(), [receiver.alert.clone()]);
+        assert_eq!(s.notify_targets(&log_id, &sender.slot, true, 2).unwrap(), [receiver.voip.clone()]);
+        receiver.alert.clear();
+        receiver.voip.clear();
+        s.notify_set(&receiver, 2).unwrap();
+        assert!(s.notify_targets(&log_id, &sender.slot, false, 3).unwrap().is_empty());
+        assert_eq!(s.notify_targets(&log_id, &receiver.slot, false, 3).unwrap(), [sender.alert.clone()]);
+        sender.alert.clear();
+        sender.voip.clear();
+        s.notify_set(&sender, 3).unwrap();
+        assert!(s.notify_targets(&log_id, &receiver.slot, true, 4).unwrap().is_empty());
+    }
 
     #[test]
     fn queue_lifecycle() {

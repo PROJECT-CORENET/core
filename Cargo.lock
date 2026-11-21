@@ -555,12 +555,15 @@ name = "core-node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "chacha20poly1305",
  "clap",
  "core-crypto",
  "core-directory",
  "core-net",
  "core-proto",
  "hex",
+ "p256",
  "prost",
  "rand 0.8.8",
  "rusqlite",
