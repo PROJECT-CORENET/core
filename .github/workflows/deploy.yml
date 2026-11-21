@@ -100,6 +100,8 @@ jobs:
     if: vars.CORE_PUSH_PORT != ''
     runs-on: [self-hosted, proxy]
     environment: push-apns
+    outputs:
+      gateway: ${{ steps.gateway.outputs.address }}
     steps:
       - name: Image tag
         id: tag
@@ -110,6 +112,7 @@ jobs:
           echo "IMAGE=$(echo "$IMAGE_REPO" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
 
       - name: Start APNs gateway
+        id: gateway
         env:
           APNS_KEY_P8: ${{ secrets.APNS_KEY_P8 }}
           APNS_KEY_ID: ${{ secrets.APNS_KEY_ID }}
@@ -125,8 +128,9 @@ jobs:
           public="${CORE_PUBLIC_MAILBOX%:*}:$CORE_PUSH_PORT"
           docker volume create core-push-data >/dev/null
           address=$(docker run --rm -v core-push-data:/data -e CORE_PUBLIC_HOST="$public" "$image" info | sed -n 's/^address: //p')
-          if [ "$address" != "$CORE_PUSH_GATEWAY" ]; then
-            echo "Set CORE_PUSH_GATEWAY to $address and rerun."
+          [ -n "$address" ] || { echo "Could not discover the push gateway address"; exit 1; }
+          if [ -n "$CORE_PUSH_GATEWAY" ] && [ "$address" != "$CORE_PUSH_GATEWAY" ]; then
+            echo "Configured CORE_PUSH_GATEWAY does not match $address"
             exit 1
           fi
           printf '%s\n' "$APNS_KEY_P8" | docker run --rm -i --user root --entrypoint /bin/sh -v core-push-data:/data "$image" -ec '
@@ -141,10 +145,20 @@ jobs:
             -e CORE_PUBLIC_HOST="$public" -e CORE_NAME=CORE-Push \
             -e CORE_PUSH_DB=/data/push.db -e APNS_KEY_FILE=/data/apns-key.p8 -e APNS_KEY_ID -e APNS_TEAM_ID \
             "$image" run
+          for attempt in $(seq 1 15); do
+            if docker exec core-push core-healthcheck; then
+              echo "address=$address" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs --tail 30 core-push
+          exit 1
 
   # 2. Запустить ноды: bootstrap — все остальные ноды сети.
   run:
-    needs: identity
+    needs: [identity, push]
+    if: ${{ !cancelled() && needs.identity.result == 'success' && (needs.push.result == 'success' || needs.push.result == 'skipped') }}
     strategy:
       fail-fast: false
       matrix:
@@ -176,7 +190,7 @@ jobs:
 
       - name: Start node
         env:
-          CORE_PUSH_GATEWAY: ${{ vars.CORE_PUSH_GATEWAY }}
+          CORE_PUSH_GATEWAY: ${{ needs.push.outputs.gateway || vars.CORE_PUSH_GATEWAY }}
         run: |
           port="${{ matrix.host }}"; port="${port##*:}"
           docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
@@ -214,7 +228,8 @@ jobs:
 
   # 3. Проверка снаружи: каждая нода отвечает по публичному адресу; готовый nodes.json для приложения.
   verify:
-    needs: run
+    needs: [run, push]
+    if: ${{ !cancelled() && needs.run.result == 'success' }}
     runs-on: [self-hosted, proxy]
     steps:
       - name: Image tag
@@ -257,6 +272,8 @@ jobs:
 
       - name: nodes.json
         if: always()
+        env:
+          CORE_PUSH_GATEWAY: ${{ needs.push.outputs.gateway || vars.CORE_PUSH_GATEWAY }}
         run: |
           mkdir -p out
           {
@@ -273,6 +290,24 @@ jobs:
             echo
             echo "]"
           } > out/nodes.json
+          # Keep gateway metadata separate so older clients cannot select it as a mailbox.
+          printf '%s\n' '[]' > out/push.json
+          if [ -n "$CORE_PUSH_GATEWAY" ]; then
+            online=false
+            if docker run --rm --entrypoint core-cli "$IMAGE:${{ steps.tag.outputs.tag }}" ping --count 1 "$CORE_PUSH_GATEWAY" >/dev/null 2>&1; then
+              online=true
+            fi
+            python3 - "$CORE_PUSH_GATEWAY" "$online" <<'PYTHON'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path("out/push.json")
+          nodes = [{"name": "CORE-Push", "region": "RU", "address": sys.argv[1],
+                    "online": sys.argv[2] == "true", "role": "push"}]
+          path.write_text(json.dumps(nodes, indent=2) + "\n")
+          PYTHON
+          fi
           cat out/nodes.json
           {
             echo
@@ -286,7 +321,9 @@ jobs:
         if: always()
         with:
           name: nodes-json
-          path: out/nodes.json
+          path: |
+            out/nodes.json
+            out/push.json
 
   # 4. Страница со списком нод на GitHub Pages + nodes.json рядом: из него приложение выбирает
   #    ближайшую ноду, а ноды с GIT_NODES=1 — соседей. Один раз: Settings → Pages → Source: GitHub Actions.
