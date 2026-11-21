@@ -246,6 +246,34 @@ impl Apns {
     }
 }
 
+/// Mailboxes use an operator-pinned address; clients cannot make a mailbox dial an arbitrary host.
+pub(crate) fn forwarder() -> std::io::Result<Option<mpsc::Sender<PushNotify>>> {
+    let Ok(raw) = std::env::var("CORE_PUSH_GATEWAY") else { return Ok(None) };
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    let address: core_net::NodeAddr = raw.parse().map_err(std::io::Error::other)?;
+    let (sender, mut receiver) = mpsc::channel::<PushNotify>(256);
+    tokio::spawn(async move {
+        let mut conn: Option<core_net::Client> = None;
+        while let Some(notification) = receiver.recv().await {
+            if conn.is_none() {
+                let dial = tokio::time::timeout(Duration::from_secs(3), core_net::Client::connect(&address)).await;
+                if let Ok(Ok((client, _events))) = dial {
+                    conn = Some(client);
+                }
+            }
+            if let Some(client) = &conn {
+                let request = client.request(core_proto::msg::request::Body::PushNotify(notification), None);
+                if !matches!(tokio::time::timeout(Duration::from_secs(3), request).await, Ok(Ok(_))) {
+                    conn = None;
+                }
+            }
+        }
+    });
+    Ok(Some(sender))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,32 +306,4 @@ mod tests {
         assert_eq!(item.call, Some(call.call_id));
         assert!(receiver.try_recv().is_err());
     }
-}
-
-/// Mailboxes use an operator-pinned address; clients cannot make a mailbox dial an arbitrary host.
-pub(crate) fn forwarder() -> std::io::Result<Option<mpsc::Sender<PushNotify>>> {
-    let Ok(raw) = std::env::var("CORE_PUSH_GATEWAY") else { return Ok(None) };
-    if raw.trim().is_empty() {
-        return Ok(None);
-    }
-    let address: core_net::NodeAddr = raw.parse().map_err(std::io::Error::other)?;
-    let (sender, mut receiver) = mpsc::channel::<PushNotify>(256);
-    tokio::spawn(async move {
-        let mut conn: Option<core_net::Client> = None;
-        while let Some(notification) = receiver.recv().await {
-            if conn.is_none() {
-                let dial = tokio::time::timeout(Duration::from_secs(3), core_net::Client::connect(&address)).await;
-                if let Ok(Ok((client, _events))) = dial {
-                    conn = Some(client);
-                }
-            }
-            if let Some(client) = &conn {
-                let request = client.request(core_proto::msg::request::Body::PushNotify(notification), None);
-                if !matches!(tokio::time::timeout(Duration::from_secs(3), request).await, Ok(Ok(_))) {
-                    conn = None;
-                }
-            }
-        }
-    });
-    Ok(Some(sender))
 }
