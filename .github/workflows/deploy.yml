@@ -142,7 +142,8 @@ jobs:
           docker rm -f core-push >/dev/null 2>&1 || true
           docker run -d --name core-push --restart unless-stopped \
             -p "$CORE_PUSH_PORT:$INNER_PORT" -v core-push-data:/data \
-            -e CORE_PUBLIC_HOST="$public" -e CORE_NAME=CORE-Push \
+            -e CORE_PUBLIC_HOST="$public" -e CORE_NAME=Push \
+            -e CORE_REGION=RU \
             -e CORE_PUSH_DB=/data/push.db -e APNS_KEY_FILE=/data/apns-key.p8 -e APNS_KEY_ID -e APNS_TEAM_ID \
             "$image" run
           for attempt in $(seq 1 15); do
