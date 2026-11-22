@@ -503,6 +503,10 @@ impl CoreClient {
         self.inner.set_listener(Arc::new(ListenerBridge(listener)));
     }
 
+    pub fn set_presence(&self, active: bool) {
+        self.inner.set_presence(active);
+    }
+
     pub async fn notification_keys(&self, chat_ids: Vec<String>) -> Result<String, CoreError> {
         Ok(self.inner.notification_keys(&chat_ids).await?)
     }

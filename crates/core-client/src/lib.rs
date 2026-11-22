@@ -13,6 +13,7 @@ mod link;
 mod media;
 mod notification;
 pub mod payload;
+mod presence;
 mod store;
 mod sync;
 
@@ -309,6 +310,7 @@ struct Inner {
     engine: tokio::sync::Mutex<Engine>,
     conns: Mutex<HashMap<String, Arc<NetClient>>>,
     push_nodes: Mutex<HashMap<String, bool>>,
+    presence: presence::State,
     connecting: tokio::sync::Mutex<()>,
     events: mpsc::UnboundedSender<(String, Event)>,
     listener: RwLock<Option<Arc<dyn Listener>>>,
@@ -461,6 +463,7 @@ impl Client {
             engine: tokio::sync::Mutex::new(Engine { provider, signer, credential }),
             conns: Mutex::default(),
             push_nodes: Mutex::default(),
+            presence: presence::State::default(),
             connecting: tokio::sync::Mutex::new(()),
             events: tx,
             listener: RwLock::new(None),
@@ -480,6 +483,7 @@ impl Client {
         tokio::spawn(reconnect_loop(Arc::downgrade(&inner)));
         tokio::spawn(retry_loop(Arc::downgrade(&inner)));
         tokio::spawn(mirror_read_loop(Arc::downgrade(&inner)));
+        tokio::spawn(presence::run(Arc::downgrade(&inner)));
         let client = Self { inner };
         {
             // Догрузка пропущенного: пока приложение было закрыто, загрузка прервалась или файл
@@ -1774,6 +1778,7 @@ impl Inner {
                     self.process_entry(&mut engine, &chat, entry).await?;
                 }
             }
+            Some(event::Body::PresenceUpdate(update)) => self.presence_update(node, update),
             Some(event::Body::QueueMessage(m)) => {
                 let invite = self.store.queues("invites")?.into_iter().find(|q| q.recipient_id == m.recipient_id);
                 let join = self.store.queues("joins")?.into_iter().find(|q| q.recipient_id == m.recipient_id);

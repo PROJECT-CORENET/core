@@ -30,7 +30,7 @@ use crate::store::{CallRow, ChatRow, ChatState};
 use crate::{new_id, now_ms, Client, Error, Inner, Result, REQUEST_TIMEOUT};
 
 /// Сколько звонит вызов без ответа.
-pub const RING_TIMEOUT_MS: u64 = 45_000;
+pub const RING_TIMEOUT_MS: u64 = 60_000;
 /// Групповой звонок без событий дольше этого считается завершённым (все ушли не попрощавшись).
 const GROUP_STALE_MS: u64 = 6 * 3600 * 1000;
 const HEARTBEAT: Duration = Duration::from_secs(1);
@@ -285,6 +285,9 @@ impl Client {
             return Err(Error::Other("call has ended".into()));
         }
         let chat = inner.store.chat(&row.chat_id)?.ok_or(Error::NoChat)?;
+        if row.joined_ms.is_none() && now_ms().saturating_sub(row.ts) >= RING_TIMEOUT_MS {
+            return Err(Error::Other("call has ended".into()));
+        }
         if !row.members.contains(&inner.me) {
             row.members.push(inner.me.clone());
         }
@@ -498,8 +501,20 @@ impl Inner {
                 };
                 if self.store.insert_call(&row)? {
                     self.store.update_call(&row)?;
-                    if sender != self.me && now_ms().saturating_sub(ts) < RING_TIMEOUT_MS {
-                        info!("📞 incoming call {id} chat={} video={video}", chat.id);
+                    if sender != self.me {
+                        let remaining = RING_TIMEOUT_MS.saturating_sub(now_ms().saturating_sub(ts));
+                        if remaining > 0 {
+                            let inner = Arc::downgrade(self);
+                            let call_id = id.clone();
+                            self.rt.spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(remaining)).await;
+                                if let Some(inner) = inner.upgrade() {
+                                    if let Some(listener) = inner.listener.read().unwrap().clone() {
+                                        listener.call_changed(call_id);
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
             }
@@ -781,12 +796,9 @@ async fn heartbeat_loop(inner: Weak<Inner>, s: Arc<Session>) {
                 l.call_changed(s.id.clone());
             }
         }
-        if !s.direct {
-            continue;
-        }
         let Ok(Some(row)) = inner.store.call(&s.id) else { continue };
-        let unanswered = row.joined_ms.is_none() && now_ms().saturating_sub(row.ts) > RING_TIMEOUT_MS;
-        if (s.initiator && unanswered) || (row.joined_ms.is_some() && lost) {
+        let unanswered = row.joined_ms.is_none() && now_ms().saturating_sub(row.ts) >= RING_TIMEOUT_MS;
+        if (s.initiator && unanswered) || (s.direct && row.joined_ms.is_some() && lost) {
             info!("⏱️ call {} timed out (unanswered={unanswered})", s.id);
             let client = Client { inner: inner.clone() };
             let id = s.id.clone();

@@ -84,6 +84,22 @@ async fn invite_chat_files_and_group() {
     eventually("typing event", || spy.0.lock().unwrap().contains(&(b_chat.clone(), "voice".to_string()))).await;
     assert_eq!(texts(&bob, &b_chat), ["Привет, Боб!"], "typing is not a message");
 
+    let alice_spy = Arc::new(TypingSpy(Mutex::default()));
+    alice.set_listener(alice_spy.clone());
+    alice.set_presence(true);
+    bob.set_presence(true);
+    eventually("bob appears online without a message", || {
+        alice_spy.0.lock().unwrap().iter().any(|(id, kind)| id == &a_chat && kind.starts_with("online:"))
+    })
+    .await;
+    bob.set_presence(false);
+    eventually("bob goes offline without a message", || {
+        alice_spy.0.lock().unwrap().iter().any(|(id, kind)| id == &a_chat && kind.starts_with("offline:"))
+    })
+    .await;
+    assert_eq!(texts(&bob, &b_chat), ["Привет, Боб!"], "presence is not a message");
+    alice.set_presence(false);
+
     // Архив: чат прячется, а новое сообщение возвращает его (чат не заглушён).
     alice.set_archived(&a_chat, true).unwrap();
     assert!(alice.chat(&a_chat).unwrap().archived);
