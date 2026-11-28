@@ -113,6 +113,9 @@ async fn invite_chat_files_and_group() {
     assert_eq!(bob.chat(&b_chat).unwrap().unread, 0);
     eventually("read receipt", || alice.messages(&a_chat, 10, None).unwrap()[0].status == MessageStatus::Read).await;
 
+    assert!(alice.chat(&a_chat).unwrap().peer_read_ms > 0);
+    assert_eq!(bob.chat(&b_chat).unwrap().peer_read_ms, 0);
+
     // Пересылка: у получателя видно, от кого оригинал.
     let karl = "ab".repeat(32);
     bob.forward_text(&b_chat, "Встреча в 7", None, "Карл", Some(karl.clone())).await.unwrap();

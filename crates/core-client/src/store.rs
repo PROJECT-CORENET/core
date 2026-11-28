@@ -133,6 +133,7 @@ CREATE TABLE IF NOT EXISTS chats (
     read_offset INTEGER NOT NULL DEFAULT 0, state INTEGER NOT NULL, created_ms INTEGER NOT NULL,
     last_ms INTEGER NOT NULL, unread INTEGER NOT NULL DEFAULT 0, muted INTEGER NOT NULL DEFAULT 0,
     pinned INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS peer_reads (chat_id TEXT NOT NULL, member_id TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY(chat_id, member_id));
 CREATE TABLE IF NOT EXISTS members (
     chat_id TEXT NOT NULL, member_id TEXT NOT NULL, name TEXT NOT NULL, avatar BLOB,
     PRIMARY KEY (chat_id, member_id));
@@ -605,6 +606,7 @@ impl Store {
             for table in ["chats WHERE id", "members WHERE chat_id", "invites WHERE chat_id", "joins WHERE chat_id"] {
                 c.execute(&format!("DELETE FROM {table} = ?"), [id])?;
             }
+            c.execute("DELETE FROM peer_reads WHERE chat_id = ?", [id])?;
             c.execute("DELETE FROM own_offsets WHERE chat_id = ?", [id])?;
             c.execute("DELETE FROM messages WHERE chat_id = ?", [id])?;
             c.execute("DELETE FROM mirrors WHERE chat_id = ?", [id])?;
@@ -951,11 +953,24 @@ impl Store {
     }
 
     /// Отметить свои сообщения прочитанными собеседником (до `up_to` включительно).
-    pub fn mark_outgoing_read(&self, chat_id: &str, up_to: u64) -> Result<usize> {
+    pub fn mark_outgoing_read(&self, chat_id: &str, up_to: u64, peer: &str, ts: u64) -> Result<()> {
         self.with(|c| {
-            c.execute(
+            let tx = c.unchecked_transaction()?;
+            tx.execute("INSERT INTO peer_reads(chat_id, member_id, ts) VALUES (?, ?, ?) ON CONFLICT(chat_id, member_id) DO UPDATE SET ts = MAX(ts, excluded.ts)", params![chat_id, peer, ts as i64])?;
+            tx.execute(
                 "UPDATE messages SET status = 2 WHERE chat_id = ? AND outgoing = 1 AND status IN (1, 5) AND ts <= ?",
                 params![chat_id, up_to as i64],
+            )?;
+            tx.commit()
+        })
+    }
+
+    pub fn peer_read_ms(&self, chat_id: &str, peer: &str) -> Result<u64> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT COALESCE(MAX(ts), 0) FROM peer_reads WHERE chat_id = ? AND member_id = ?",
+                [chat_id, peer],
+                |r| Ok(r.get::<_, i64>(0)? as u64),
             )
         })
     }

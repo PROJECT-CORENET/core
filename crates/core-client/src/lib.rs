@@ -127,6 +127,7 @@ pub struct Chat {
     pub muted: bool,
     pub pinned: bool,
     pub last_ms: u64,
+    pub peer_read_ms: u64,
     pub last_message: Option<Message>,
     pub avatar: Option<Vec<u8>>,
     pub members: Vec<Member>,
@@ -1173,6 +1174,10 @@ impl Inner {
         let names = others.iter().map(|m| (m.member_id.clone(), m.name.clone())).collect();
         let is_saved = self.saved_id().as_deref() == Some(row.id.as_str());
         let is_group = !is_saved && (row.custom_title || others.len() > 1);
+        let peer_read_ms = match others.as_slice() {
+            [peer] if !is_group && !is_saved => self.store.peer_read_ms(&row.id, &peer.member_id)?,
+            _ => 0,
+        };
         let title = if row.custom_title || others.is_empty() {
             row.title.clone()
         } else {
@@ -1205,6 +1210,7 @@ impl Inner {
             muted: row.muted,
             pinned: row.pinned,
             last_ms: row.last_ms,
+            peer_read_ms,
             avatar,
             members,
             can_invite: row.state == ChatState::Active && !is_saved,
@@ -1386,7 +1392,7 @@ impl Inner {
                         if let ProcessedMessageContent::ApplicationMessage(app) = processed.into_content() {
                             engine.save(&self.store)?;
                             if let Ok(payload) = serde_json::from_slice::<Payload>(&app.into_bytes()) {
-                                self.apply_payload(&chat, &sender, payload, &engine).await?;
+                                self.apply_payload(&chat, &sender, payload, entry.received_at_ms, &engine).await?;
                             }
                         }
                     }
@@ -1959,7 +1965,7 @@ impl Inner {
             ProcessedMessageContent::ApplicationMessage(app) => {
                 engine.save(&self.store)?;
                 if let Ok(payload) = serde_json::from_slice::<Payload>(&app.into_bytes()) {
-                    self.apply_payload(&chat, &sender, payload, engine).await?;
+                    self.apply_payload(&chat, &sender, payload, entry.received_at_ms, engine).await?;
                 }
             }
             ProcessedMessageContent::StagedCommitMessage(commit) => {
@@ -2022,6 +2028,7 @@ impl Inner {
         chat: &ChatRow,
         sender: &str,
         payload: Payload,
+        received_at_ms: u64,
         engine: &Engine,
     ) -> Result<()> {
         // Заблокированный собеседник: его сообщения, реакции и «печатает…» не принимаются
@@ -2126,7 +2133,7 @@ impl Inner {
                 self.notify(None);
             }
             Payload::Read { up_to } => {
-                self.store.mark_outgoing_read(&chat.id, up_to)?;
+                self.store.mark_outgoing_read(&chat.id, up_to, sender, received_at_ms.min(now_ms()))?;
             }
             Payload::Typing { kind, ts } => {
                 // Догоняя историю, старые «печатает…» не показываем.
