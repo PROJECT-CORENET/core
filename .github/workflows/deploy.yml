@@ -94,6 +94,46 @@ jobs:
             out/${{ matrix.name }}.region
           retention-days: 7
 
+  stickers:
+    needs: identity
+    runs-on: [self-hosted, nl]
+    outputs:
+      url: ${{ steps.service.outputs.url }}
+      certificate: ${{ steps.service.outputs.certificate }}
+    steps:
+      - name: Deploy sticker importer on N2
+        id: service
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          STICKER_IP: "141.98.235.172"
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+            echo "N2 sticker importer requires repository secret TELEGRAM_BOT_TOKEN." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          tag="$TAG"
+          case "$tag" in sha-*) tag="sha-$(echo "${tag#sha-}" | cut -c1-7)";; esac
+          owner=$(echo "$GITHUB_REPOSITORY_OWNER" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/$owner/core-sticker-import:$tag"
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker pull "$image"
+          docker rm -f core-sticker-import >/dev/null 2>&1 || true
+          docker run -d --name core-sticker-import --restart unless-stopped --memory 512m \
+            --security-opt no-new-privileges -p 8448:8080 -e TELEGRAM_BOT_TOKEN -e STICKER_IP \
+            -v core-sticker-tls:/app/tls "$image" sh /app/serve-tls.sh
+          cert=$(mktemp)
+          trap 'rm -f "$cert"' EXIT
+          for attempt in $(seq 1 15); do
+            if docker exec core-sticker-import cat /app/tls/cert.pem > "$cert" 2>/dev/null && [ -s "$cert" ]; then break; fi
+            sleep 1
+          done
+          curl --fail --silent --show-error --retry 8 --retry-connrefused --retry-delay 1 \
+            --noproxy '*' --connect-to "$STICKER_IP:8448:127.0.0.1:8448" --cacert "$cert" "https://$STICKER_IP:8448/health"
+          echo "url=https://$STICKER_IP:8448" >> "$GITHUB_OUTPUT"
+          echo "certificate=$(openssl x509 -in "$cert" -outform DER | base64 -w0)" >> "$GITHUB_OUTPUT"
+
   # APNs credentials are available only to the dedicated gateway job.
   push:
     needs: identity
@@ -329,7 +369,7 @@ jobs:
   # 4. Страница со списком нод на GitHub Pages + nodes.json рядом: из него приложение выбирает
   #    ближайшую ноду, а ноды с GIT_NODES=1 — соседей. Один раз: Settings → Pages → Source: GitHub Actions.
   pages:
-    needs: verify
+    needs: [verify, stickers]
     if: always() && needs.verify.result != 'skipped' && needs.verify.result != 'cancelled'
     runs-on: ubuntu-latest
     permissions:
@@ -348,6 +388,13 @@ jobs:
         with:
           name: nodes-json
           path: site
+
+      - name: Publish sticker import address
+        if: needs.stickers.outputs.url != ''
+        env:
+          PUBLIC_URL: ${{ needs.stickers.outputs.url }}
+          CERTIFICATE: ${{ needs.stickers.outputs.certificate }}
+        run: python3 -c 'import json,os,pathlib; pathlib.Path("site/stickers.json").write_text(json.dumps({"url":os.environ["PUBLIC_URL"],"certificate":os.environ["CERTIFICATE"]}))'
 
       - name: Build page
         run: |
