@@ -119,6 +119,8 @@ jobs:
           image="ghcr.io/$owner/core-sticker-import:$tag"
           echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker pull "$image"
+          docker volume create core-sticker-tls >/dev/null
+          docker run --rm --user root -v core-sticker-tls:/app/tls "$image" chown -R nobody:nogroup /app/tls
           docker rm -f core-sticker-import >/dev/null 2>&1 || true
           docker run -d --name core-sticker-import --restart unless-stopped --memory 512m \
             --security-opt no-new-privileges -p 8448:8080 -e TELEGRAM_BOT_TOKEN -e STICKER_IP \
@@ -129,8 +131,11 @@ jobs:
             if docker exec core-sticker-import cat /app/tls/cert.pem > "$cert" 2>/dev/null && [ -s "$cert" ]; then break; fi
             sleep 1
           done
-          curl --fail --silent --show-error --retry 8 --retry-connrefused --retry-delay 1 \
-            --noproxy '*' --connect-to "$STICKER_IP:8448:127.0.0.1:8448" --cacert "$cert" "https://$STICKER_IP:8448/health"
+          if ! curl --fail --silent --show-error --retry 15 --retry-all-errors --retry-delay 1 \
+            --noproxy '*' --connect-to "$STICKER_IP:8448:127.0.0.1:8448" --cacert "$cert" "https://$STICKER_IP:8448/health"; then
+            docker logs --tail 50 core-sticker-import
+            exit 1
+          fi
           echo "url=https://$STICKER_IP:8448" >> "$GITHUB_OUTPUT"
           echo "certificate=$(openssl x509 -in "$cert" -outform DER | base64 -w0)" >> "$GITHUB_OUTPUT"
 
