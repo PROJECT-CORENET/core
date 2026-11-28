@@ -4,4 +4,5 @@ WORKDIR /app
 COPY service.py serve-tls.sh ./
 RUN install -d -m 0700 -o nobody -g nogroup /app/tls
 USER nobody
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "75", "service:app"]
+# CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "75", "service:app"]
+CMD ["sh", "./serve-tls.sh"]
