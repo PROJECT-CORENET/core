@@ -295,15 +295,30 @@ impl Store {
         Ok(())
     }
 
-    pub fn notify_targets(&self, log: &[u8], sender: &[u8], voip: bool, now: u64) -> Result<Vec<Vec<u8>>> {
+    pub fn notify_targets(
+        &self,
+        log: &[u8],
+        sender: &[u8],
+        linked: &[Vec<u8>],
+        voip: bool,
+        now: u64,
+    ) -> Result<Vec<Vec<u8>>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT CASE WHEN ?1 THEN voip ELSE alert END FROM log_notifications WHERE log_id = ?2 AND slot != ?3 AND expires > ?4",
+            "SELECT CASE WHEN ?1 THEN voip ELSE alert END, slot FROM log_notifications WHERE log_id = ?2 AND slot != ?3 AND expires > ?4",
         )?;
         let targets = stmt
-            .query_map(params![voip, log, sender, now as i64], |row| row.get::<_, Vec<u8>>(0))?
+            .query_map(params![voip, log, sender, now as i64], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(targets.into_iter().filter(|entry| !entry.is_empty()).collect())
+        let mut seen = std::collections::HashSet::new();
+        Ok(targets
+            .into_iter()
+            .filter_map(|(entry, slot)| {
+                (!entry.is_empty() && !linked.contains(&slot) && seen.insert(entry.clone())).then_some(entry)
+            })
+            .collect())
     }
 
     pub fn log_append(&self, log_id: &[u8], blob: &[u8], now: u64) -> Result<LogEntry> {
@@ -438,17 +453,21 @@ mod tests {
             NotifySet { log_id: log_id.clone(), slot: vec![2; 16], alert: vec![21; 32], voip: vec![22; 32] };
         s.notify_set(&sender, 1).unwrap();
         s.notify_set(&receiver, 1).unwrap();
-        assert_eq!(s.notify_targets(&log_id, &sender.slot, false, 2).unwrap(), [receiver.alert.clone()]);
-        assert_eq!(s.notify_targets(&log_id, &sender.slot, true, 2).unwrap(), [receiver.voip.clone()]);
+        assert!(s
+            .notify_targets(&log_id, &sender.slot, std::slice::from_ref(&receiver.slot), false, 2)
+            .unwrap()
+            .is_empty());
+        assert_eq!(s.notify_targets(&log_id, &sender.slot, &[], false, 2).unwrap(), [receiver.alert.clone()]);
+        assert_eq!(s.notify_targets(&log_id, &sender.slot, &[], true, 2).unwrap(), [receiver.voip.clone()]);
         receiver.alert.clear();
         receiver.voip.clear();
         s.notify_set(&receiver, 2).unwrap();
-        assert!(s.notify_targets(&log_id, &sender.slot, false, 3).unwrap().is_empty());
-        assert_eq!(s.notify_targets(&log_id, &receiver.slot, false, 3).unwrap(), [sender.alert.clone()]);
+        assert!(s.notify_targets(&log_id, &sender.slot, &[], false, 3).unwrap().is_empty());
+        assert_eq!(s.notify_targets(&log_id, &receiver.slot, &[], false, 3).unwrap(), [sender.alert.clone()]);
         sender.alert.clear();
         sender.voip.clear();
         s.notify_set(&sender, 3).unwrap();
-        assert!(s.notify_targets(&log_id, &receiver.slot, true, 4).unwrap().is_empty());
+        assert!(s.notify_targets(&log_id, &receiver.slot, &[], true, 4).unwrap().is_empty());
     }
 
     #[test]

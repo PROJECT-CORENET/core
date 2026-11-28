@@ -486,11 +486,20 @@ impl Conn {
                 if c.alert || !c.call_id.is_empty() {
                     check_len(&c.sender_slot, 16, "sender notification slot")?;
                 }
+                if c.linked_sender_slots.len() > 128 || c.linked_sender_slots.iter().any(|slot| slot.len() != 16) {
+                    return Err(Fail::bad("invalid linked notification slots"));
+                }
                 let entry = store.log_append(&c.log_id, &c.blob, now)?;
                 let offset = entry.offset;
                 self.state.hub.publish_log(&c.log_id, entry);
                 if let Some(forward) = self.state.push_forward.as_ref().filter(|_| c.alert || !c.call_id.is_empty()) {
-                    match store.notify_targets(&c.log_id, &c.sender_slot, !c.call_id.is_empty(), now) {
+                    match store.notify_targets(
+                        &c.log_id,
+                        &c.sender_slot,
+                        &c.linked_sender_slots,
+                        !c.call_id.is_empty(),
+                        now,
+                    ) {
                         Ok(targets) => {
                             for capability in targets {
                                 if forward

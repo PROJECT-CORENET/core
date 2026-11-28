@@ -254,6 +254,8 @@ pub struct LogAppend {
     pub sender_slot: Vec<u8>,
     #[prost(bytes = "vec", tag = "6")]
     pub preview: Vec<u8>,
+    #[prost(bytes = "vec", repeated, tag = "7")]
+    pub linked_sender_slots: Vec<Vec<u8>>,
 }
 
 /// MLS-коммит: принимается, только если для `epoch` коммита ещё нет (compare-and-swap).

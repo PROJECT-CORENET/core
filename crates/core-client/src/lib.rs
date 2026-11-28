@@ -1534,6 +1534,20 @@ impl Inner {
                 append.call_id = hex::decode(id).unwrap_or_default();
             }
             if append.alert || !append.call_id.is_empty() {
+                if append.alert {
+                    append.linked_sender_slots = self
+                        .devices()?
+                        .into_iter()
+                        .filter(|device| !device.is_this)
+                        .take(128)
+                        .map(|device| {
+                            core_crypto::sha256(
+                                &[b"CORE/Push/slot".as_slice(), device.id.as_bytes(), &chat.log_id].concat(),
+                            )[..16]
+                                .to_vec()
+                        })
+                        .collect();
+                }
                 append.sender_slot = self.push_slot(&chat.log_id, b"CORE/Push/slot");
             }
         }
